@@ -8,8 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 
 # ========================================================
-# ⚠️ ВСТАВЬТЕ СВОЙ ТОКЕН БОТА НИЖЕ
-API_TOKEN = '8848306379:AAGAgwUsiXXFIBC5Bfh08G8OTtufxEHAx0s'
+API_TOKEN = 'В8848306379:AAGAgwUsiXXFIBC5Bfh08G8OTtufxEHAx0s'
 # ========================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +22,7 @@ async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_NAME)
     
-    # Таблица для хранения сообщений
+    # Таблица сохраненных сообщений
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             message_id INTEGER, 
@@ -33,16 +32,16 @@ async def init_db():
             text_content TEXT, 
             file_id TEXT, 
             media_type TEXT,
-            owner_user_id INTEGER,
+            connection_id TEXT,
             PRIMARY KEY (message_id, chat_id)
         )
     ''')
     
-    # Таблица для связывания business_connection_id с Telegram ID владельца
+    # Таблица связей: connection_id -> Telegram ID владельца
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS connections (
             connection_id TEXT PRIMARY KEY,
-            user_id INTEGER
+            owner_user_id INTEGER
         )
     ''')
     
@@ -53,48 +52,43 @@ async def init_db():
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     welcome_text = (
-        "Привет! Бот активен и готов сохранять удаленные сообщения из вашего Telegram Business."
+        "👋 Привет!\n\n"
+        "Я бот для сохранения удалённых сообщений из **Telegram Business**.\n\n"
+        "1️⃣ Подключите меня в **Настройки ➔ Telegram Business ➔ Чат-боты**.\n"
+        "2️⃣ Все удалённые сообщения и медиафайлы из ваших бизнес-чатов будут приходить прямо сюда!"
     )
-    await message.answer(welcome_text)
+    await message.answer(welcome_text, parse_mode="Markdown")
 
 
-# Сохранение подключения Telegram Business
+# 1. Обработка подключения/отключения бота к Telegram Business
 @dp.business_connection()
 async def handle_business_connection(connection: types.BusinessConnection):
     try:
-        await db_conn.execute(
-            "INSERT OR REPLACE INTO connections (connection_id, user_id) VALUES (?, ?)",
-            (connection.id, connection.user.id)
-        )
-        await db_conn.commit()
-        logging.info(f"[ПОДКЛЮЧЕНИЕ] Связь {connection.id} закреплена за пользователем {connection.user.id}")
+        if connection.is_enabled:
+            # Сохраняем, какой именно пользователь владеет этим connection.id
+            await db_conn.execute(
+                "INSERT OR REPLACE INTO connections (connection_id, owner_user_id) VALUES (?, ?)",
+                (connection.id, connection.user.id)
+            )
+            await db_conn.commit()
+            logging.info(f"[БИЗНЕС] Связь {connection.id} успешно закреплена за пользователем {connection.user.id}")
+        else:
+            # Если пользователь отключил бота
+            await db_conn.execute("DELETE FROM connections WHERE connection_id = ?", (connection.id,))
+            await db_conn.commit()
+            logging.info(f"[БИЗНЕС] Связь {connection.id} была удалена.")
     except Exception as e:
         logging.error(f"Ошибка в handle_business_connection: {e}")
 
 
+# 2. Обработка входящих бизнес-сообщений
 @dp.business_message()
 async def handle_business_message(message: types.Message):
     try:
-        # Находим владельца бизнес-аккаунта по connection_id
-        owner_user_id = None
-        if message.business_connection_id:
-            async with db_conn.execute(
-                "SELECT user_id FROM connections WHERE connection_id = ?",
-                (message.business_connection_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    owner_user_id = row[0]
-
-        # Если не нашли по соединению, но сообщение отправил сам владелец
-        if not owner_user_id and message.from_user:
-            owner_user_id = message.from_user.id
-
         content = message.text or message.caption or ""
         file_id = None
         media_type = None
 
-        # Фиксация различных типов медиафайлов
         if message.photo:
             file_id = message.photo[-1].file_id
             media_type = "photo"
@@ -129,26 +123,38 @@ async def handle_business_message(message: types.Message):
         sender = message.from_user.full_name if message.from_user else "Собеседник"
         username = f"@{message.from_user.username}" if message.from_user and message.from_user.username else "@нет_юзернейма"
 
+        conn_id = message.business_connection_id
+
+        # Автоматическая регистрация связи, если она ещё не была записана
+        if conn_id and message.from_user:
+            await db_conn.execute(
+                "INSERT OR IGNORE INTO connections (connection_id, owner_user_id) VALUES (?, ?)",
+                (conn_id, message.from_user.id)
+            )
+
         await db_conn.execute(
-            "INSERT OR REPLACE INTO messages (message_id, chat_id, sender_name, username, text_content, file_id, media_type, owner_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (message.message_id, message.chat.id, sender, username, content, file_id, media_type, owner_user_id)
+            "INSERT OR REPLACE INTO messages (message_id, chat_id, sender_name, username, text_content, file_id, media_type, connection_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (message.message_id, message.chat.id, sender, username, content, file_id, media_type, conn_id)
         )
         await db_conn.commit()
-        logging.info(f"[БАЗА] Сохранено сообщение ID {message.message_id} ({media_type or 'текст'}) для владельца {owner_user_id}")
+        logging.info(f"[БАЗА] Сохранено сообщение ID {message.message_id} ({media_type or 'текст'})")
     except Exception as e:
         logging.error(f"Ошибка в handle_business_message: {e}")
 
 
+# 3. Обработка удаления сообщений
 @dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted):
     logging.info(f"[УДАЛЕНИЕ] Обнаружено событие удаления ID: {event.message_ids}")
     try:
-        # Определяем ID владельца бизнес-аккаунта
+        conn_id = event.business_connection_id
         owner_user_id = None
-        if event.business_connection_id:
+
+        # Ищем владельца бизнеса по connection_id
+        if conn_id:
             async with db_conn.execute(
-                "SELECT user_id FROM connections WHERE connection_id = ?",
-                (event.business_connection_id,)
+                "SELECT owner_user_id FROM connections WHERE connection_id = ?",
+                (conn_id,)
             ) as cursor:
                 row = await cursor.fetchone()
                 if row:
@@ -156,18 +162,26 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
 
         for msg_id in event.message_ids:
             async with db_conn.execute(
-                "SELECT sender_name, username, text_content, file_id, media_type, owner_user_id FROM messages WHERE message_id = ? AND chat_id = ?",
+                "SELECT sender_name, username, text_content, file_id, media_type, connection_id FROM messages WHERE message_id = ? AND chat_id = ?",
                 (msg_id, event.chat.id)
             ) as cursor:
                 row = await cursor.fetchone()
                 if row:
-                    sender_name, username, text_content, file_id, media_type, saved_owner_id = row
+                    sender_name, username, text_content, file_id, media_type, saved_conn_id = row
                     
-                    # Отправляем сообщение ИМЕННО владельцу бизнес-аккаунта
-                    target_user_id = owner_user_id or saved_owner_id
-                    
+                    # Если owner_user_id не определился выше, ищем по сохраненной связи
+                    target_user_id = owner_user_id
+                    if not target_user_id and saved_conn_id:
+                        async with db_conn.execute(
+                            "SELECT owner_user_id FROM connections WHERE connection_id = ?",
+                            (saved_conn_id,)
+                        ) as c2:
+                            r2 = await c2.fetchone()
+                            if r2:
+                                target_user_id = r2[0]
+
                     if not target_user_id:
-                        logging.warning(f"[ОШИБКА] Не удалось определить владельца бота для отправки сообщения {msg_id}")
+                        logging.warning(f"[ОШИБКА] Не удалось найти владельца аккаунта для отправки удаленного сообщения {msg_id}")
                         continue
 
                     notification = (
@@ -177,6 +191,7 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                     )
 
                     try:
+                        # Отправка ТОЛЬКО владельцу этого бизнес-аккаунта
                         if media_type == "photo" and file_id:
                             await bot.send_photo(chat_id=target_user_id, photo=file_id, caption=notification, parse_mode="HTML")
                         elif media_type == "video" and file_id:
@@ -195,7 +210,7 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                         else:
                             await bot.send_message(chat_id=target_user_id, text=notification, parse_mode="HTML")
                     except Exception as send_error:
-                        logging.error(f"Не удалось отправить сообщение пользователю {target_user_id}: {send_error}")
+                        logging.error(f"Не удалось отправить логи пользователю {target_user_id}: {send_error}")
 
                     await db_conn.execute("DELETE FROM messages WHERE message_id = ? AND chat_id = ?", (msg_id, event.chat.id))
                     await db_conn.commit()
@@ -222,12 +237,8 @@ async def start_web_server():
 async def main():
     await init_db()
     await start_web_server()
-    
-    # Сбрасываем возможные вебхуки и зависшие обновления
     await bot.delete_webhook(drop_pending_updates=True)
-    
     try:
-        # Разрешаем все типы событий
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         if db_conn:
