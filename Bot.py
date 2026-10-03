@@ -94,6 +94,7 @@ async def handle_business_message(message: types.Message):
         file_id = None
         media_type = None
 
+        # Фиксация различных типов медиафайлов
         if message.photo:
             file_id = message.photo[-1].file_id
             media_type = "photo"
@@ -102,14 +103,23 @@ async def handle_business_message(message: types.Message):
         elif message.voice:
             file_id = message.voice.file_id
             media_type = "voice"
-            content = "[Голосовое сообщение]"
+            if not content:
+                content = "[Голосовое сообщение]"
+        elif message.video_note:
+            file_id = message.video_note.file_id
+            media_type = "video_note"
+            if not content:
+                content = "[Видеосообщение (кружочек)]"
         elif message.video:
             file_id = message.video.file_id
             media_type = "video"
             if not content:
                 content = "[Видео]"
         elif message.sticker:
-            content = f"[Стикер: {message.sticker.emoji or ''}]"
+            file_id = message.sticker.file_id
+            media_type = "sticker"
+            if not content:
+                content = f"[Стикер: {message.sticker.emoji or ''}]"
 
         sender = message.from_user.full_name if message.from_user else "Собеседник"
         username = f"@{message.from_user.username}" if message.from_user and message.from_user.username else "@нет_юзернейма"
@@ -119,7 +129,7 @@ async def handle_business_message(message: types.Message):
             (message.message_id, message.chat.id, sender, username, content, file_id, media_type, owner_user_id)
         )
         await db_conn.commit()
-        logging.info(f"[БАЗА] Сохранено сообщение ID {message.message_id} для пользователя {owner_user_id}")
+        logging.info(f"[БАЗА] Сохранено сообщение ID {message.message_id} ({media_type or 'текст'}) для пользователя {owner_user_id}")
     except Exception as e:
         logging.error(f"Ошибка в handle_business_message: {e}")
 
@@ -157,31 +167,30 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                     notification = (
                         f"⚠️ <b>Удалено сообщение!</b>\n\n"
                         f"👤 <b>Отправитель:</b> {sender_name} ({username})\n"
-                        f"📝 <b>Текст:</b> {text_content}"
+                        f"📝 <b>Текст/Описание:</b> {text_content}"
                     )
 
-                    # Отправляем в ЛС конкретному владельцу
-                    if media_type == "photo" and file_id:
-                        try:
-                            await bot.send_photo(
-                                chat_id=target_user_id, 
-                                photo=file_id, 
-                                caption=notification, 
-                                parse_mode="HTML"
-                            )
-                        except Exception as e:
-                            logging.error(f"Не удалось отправить фото пользователю {target_user_id}: {e}")
-                            await bot.send_message(
-                                chat_id=target_user_id, 
-                                text=notification, 
-                                parse_mode="HTML"
-                            )
-                    else:
-                        await bot.send_message(
-                            chat_id=target_user_id, 
-                            text=notification, 
-                            parse_mode="HTML"
-                        )
+                    try:
+                        # Отправка соответствующего медиафайла владельцу в ЛС
+                        if media_type == "photo" and file_id:
+                            await bot.send_photo(chat_id=target_user_id, photo=file_id, caption=notification, parse_mode="HTML")
+                        elif media_type == "video" and file_id:
+                            await bot.send_video(chat_id=target_user_id, video=file_id, caption=notification, parse_mode="HTML")
+                        elif media_type == "video_note" and file_id:
+                            # Для кружочка и голосовых сначала присылаем текст, затем сам файл
+                            await bot.send_message(chat_id=target_user_id, text=notification, parse_mode="HTML")
+                            await bot.send_video_note(chat_id=target_user_id, video_note=file_id)
+                        elif media_type == "voice" and file_id:
+                            await bot.send_message(chat_id=target_user_id, text=notification, parse_mode="HTML")
+                            await bot.send_voice(chat_id=target_user_id, voice=file_id)
+                        elif media_type == "sticker" and file_id:
+                            await bot.send_message(chat_id=target_user_id, text=notification, parse_mode="HTML")
+                            await bot.send_sticker(chat_id=target_user_id, sticker=file_id)
+                        else:
+                            await bot.send_message(chat_id=target_user_id, text=notification, parse_mode="HTML")
+                    except Exception as send_error:
+                        logging.error(f"Не удалось отправить медиафайлы пользователю {target_user_id}: {send_error}")
+                        await bot.send_message(chat_id=target_user_id, text=notification, parse_mode="HTML")
 
                     await db_conn.execute("DELETE FROM messages WHERE message_id = ? AND chat_id = ?", (msg_id, event.chat.id))
                     await db_conn.commit()
@@ -213,7 +222,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     
     try:
-        # Явно передаем разрешенные типы событий (включая business_message и deleted_business_messages)
+        # Разрешаем все события
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         if db_conn:
