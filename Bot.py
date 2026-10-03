@@ -2,14 +2,13 @@ import logging
 import asyncio
 import aiosqlite
 import os
+import html
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 
-# ========================================================
-API_TOKEN = 'В8848306379:AAGAgwUsiXXFIBC5Bfh08G8OTtufxEHAx0s'
-# ========================================================
+API_TOKEN = os.getenv('BOT_TOKEN', '8848306379:AAGAgwUsiXXFIBC5Bfh08G8OTtufxEHAx0s')
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
@@ -22,7 +21,6 @@ async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_NAME)
     
-    # Таблица сохраненных сообщений
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             message_id INTEGER, 
@@ -37,7 +35,6 @@ async def init_db():
         )
     ''')
     
-    # Таблица связей: connection_id -> Telegram ID владельца
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS connections (
             connection_id TEXT PRIMARY KEY,
@@ -60,12 +57,10 @@ async def cmd_start(message: types.Message):
     await message.answer(welcome_text, parse_mode="Markdown")
 
 
-# 1. Обработка подключения/отключения бота к Telegram Business
 @dp.business_connection()
 async def handle_business_connection(connection: types.BusinessConnection):
     try:
         if connection.is_enabled:
-            # Сохраняем, какой именно пользователь владеет этим connection.id
             await db_conn.execute(
                 "INSERT OR REPLACE INTO connections (connection_id, owner_user_id) VALUES (?, ?)",
                 (connection.id, connection.user.id)
@@ -73,7 +68,6 @@ async def handle_business_connection(connection: types.BusinessConnection):
             await db_conn.commit()
             logging.info(f"[БИЗНЕС] Связь {connection.id} успешно закреплена за пользователем {connection.user.id}")
         else:
-            # Если пользователь отключил бота
             await db_conn.execute("DELETE FROM connections WHERE connection_id = ?", (connection.id,))
             await db_conn.commit()
             logging.info(f"[БИЗНЕС] Связь {connection.id} была удалена.")
@@ -81,7 +75,6 @@ async def handle_business_connection(connection: types.BusinessConnection):
         logging.error(f"Ошибка в handle_business_connection: {e}")
 
 
-# 2. Обработка входящих бизнес-сообщений
 @dp.business_message()
 async def handle_business_message(message: types.Message):
     try:
@@ -92,45 +85,35 @@ async def handle_business_message(message: types.Message):
         if message.photo:
             file_id = message.photo[-1].file_id
             media_type = "photo"
-            if not content:
-                content = "[Фотография]"
+            if not content: content = "[Фотография]"
         elif message.voice:
             file_id = message.voice.file_id
             media_type = "voice"
-            if not content:
-                content = "[Голосовое сообщение]"
+            if not content: content = "[Голосовое сообщение]"
         elif message.audio:
             file_id = message.audio.file_id
             media_type = "audio"
-            if not content:
-                content = f"[Аудиозапись: {message.audio.title or 'без названия'}]"
+            if not content: content = f"[Аудиозапись: {message.audio.title or 'без названия'}]"
         elif message.video_note:
             file_id = message.video_note.file_id
             media_type = "video_note"
-            if not content:
-                content = "[Видеосообщение (кружочек)]"
+            if not content: content = "[Видеосообщение (кружочек)]"
         elif message.video:
             file_id = message.video.file_id
             media_type = "video"
-            if not content:
-                content = "[Видео]"
+            if not content: content = "[Видео]"
         elif message.sticker:
             file_id = message.sticker.file_id
             media_type = "sticker"
-            if not content:
-                content = f"[Стикер: {message.sticker.emoji or ''}]"
+            if not content: content = f"[Стикер: {message.sticker.emoji or ''}]"
+        elif message.document:
+            file_id = message.document.file_id
+            media_type = "document"
+            if not content: content = f"[Документ: {message.document.file_name or 'файл'}]"
 
         sender = message.from_user.full_name if message.from_user else "Собеседник"
         username = f"@{message.from_user.username}" if message.from_user and message.from_user.username else "@нет_юзернейма"
-
         conn_id = message.business_connection_id
-
-        # Автоматическая регистрация связи, если она ещё не была записана
-        if conn_id and message.from_user:
-            await db_conn.execute(
-                "INSERT OR IGNORE INTO connections (connection_id, owner_user_id) VALUES (?, ?)",
-                (conn_id, message.from_user.id)
-            )
 
         await db_conn.execute(
             "INSERT OR REPLACE INTO messages (message_id, chat_id, sender_name, username, text_content, file_id, media_type, connection_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -142,7 +125,6 @@ async def handle_business_message(message: types.Message):
         logging.error(f"Ошибка в handle_business_message: {e}")
 
 
-# 3. Обработка удаления сообщений
 @dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted):
     logging.info(f"[УДАЛЕНИЕ] Обнаружено событие удаления ID: {event.message_ids}")
@@ -150,7 +132,6 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
         conn_id = event.business_connection_id
         owner_user_id = None
 
-        # Ищем владельца бизнеса по connection_id
         if conn_id:
             async with db_conn.execute(
                 "SELECT owner_user_id FROM connections WHERE connection_id = ?",
@@ -160,7 +141,9 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                 if row:
                     owner_user_id = row[0]
 
-        for msg_id in event.message_ids:
+        unique_message_ids = set(event.message_ids)
+
+        for msg_id in unique_message_ids:
             async with db_conn.execute(
                 "SELECT sender_name, username, text_content, file_id, media_type, connection_id FROM messages WHERE message_id = ? AND chat_id = ?",
                 (msg_id, event.chat.id)
@@ -169,7 +152,6 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                 if row:
                     sender_name, username, text_content, file_id, media_type, saved_conn_id = row
                     
-                    # Если owner_user_id не определился выше, ищем по сохраненной связи
                     target_user_id = owner_user_id
                     if not target_user_id and saved_conn_id:
                         async with db_conn.execute(
@@ -181,23 +163,28 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                                 target_user_id = r2[0]
 
                     if not target_user_id:
-                        logging.warning(f"[ОШИБКА] Не удалось найти владельца аккаунта для отправки удаленного сообщения {msg_id}")
+                        logging.warning(f"[ОШИБКА] Не удалось найти владельца аккаунта для сообщения {msg_id}")
                         continue
+
+                    # Удаление до отправки ответа
+                    await db_conn.execute("DELETE FROM messages WHERE message_id = ? AND chat_id = ?", (msg_id, event.chat.id))
+                    await db_conn.commit()
 
                     notification = (
                         f"⚠️ <b>Удалено сообщение!</b>\n\n"
-                        f"👤 <b>Отправитель:</b> {sender_name} ({username})\n"
-                        f"📝 <b>Текст/Описание:</b> {text_content}"
+                        f"👤 <b>Отправитель:</b> {html.quote(sender_name)} ({html.quote(username)})\n"
+                        f"📝 <b>Текст/Описание:</b> {html.quote(text_content)}"
                     )
 
                     try:
-                        # Отправка ТОЛЬКО владельцу этого бизнес-аккаунта
                         if media_type == "photo" and file_id:
                             await bot.send_photo(chat_id=target_user_id, photo=file_id, caption=notification, parse_mode="HTML")
                         elif media_type == "video" and file_id:
                             await bot.send_video(chat_id=target_user_id, video=file_id, caption=notification, parse_mode="HTML")
                         elif media_type == "audio" and file_id:
                             await bot.send_audio(chat_id=target_user_id, audio=file_id, caption=notification, parse_mode="HTML")
+                        elif media_type == "document" and file_id:
+                            await bot.send_document(chat_id=target_user_id, document=file_id, caption=notification, parse_mode="HTML")
                         elif media_type == "video_note" and file_id:
                             await bot.send_message(chat_id=target_user_id, text=notification, parse_mode="HTML")
                             await bot.send_video_note(chat_id=target_user_id, video_note=file_id)
@@ -212,10 +199,8 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                     except Exception as send_error:
                         logging.error(f"Не удалось отправить логи пользователю {target_user_id}: {send_error}")
 
-                    await db_conn.execute("DELETE FROM messages WHERE message_id = ? AND chat_id = ?", (msg_id, event.chat.id))
-                    await db_conn.commit()
                 else:
-                    logging.warning(f"[БАЗА] Сообщение ID {msg_id} не найдено в базе данных")
+                    logging.warning(f"[БАЗА] Сообщение ID {msg_id} не найдено или обработано ранее")
     except Exception as e:
         logging.error(f"Ошибка при обработке удаления: {e}")
 
