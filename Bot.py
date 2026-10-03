@@ -8,7 +8,9 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 
+# ========================================================
 API_TOKEN = os.getenv('BOT_TOKEN', '8848306379:AAGAgwUsiXXFIBC5Bfh08G8OTtufxEHAx0s')
+# ========================================================
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
@@ -21,6 +23,7 @@ async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_NAME)
     
+    # Таблица сохраненных сообщений
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             message_id INTEGER, 
@@ -35,6 +38,7 @@ async def init_db():
         )
     ''')
     
+    # Таблица связей: connection_id -> Telegram ID владельца
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS connections (
             connection_id TEXT PRIMARY KEY,
@@ -57,6 +61,7 @@ async def cmd_start(message: types.Message):
     await message.answer(welcome_text, parse_mode="Markdown")
 
 
+# 1. Обработка подключения/отключения бота к Telegram Business
 @dp.business_connection()
 async def handle_business_connection(connection: types.BusinessConnection):
     try:
@@ -75,6 +80,7 @@ async def handle_business_connection(connection: types.BusinessConnection):
         logging.error(f"Ошибка в handle_business_connection: {e}")
 
 
+# 2. Обработка входящих бизнес-сообщений
 @dp.business_message()
 async def handle_business_message(message: types.Message):
     try:
@@ -85,31 +91,38 @@ async def handle_business_message(message: types.Message):
         if message.photo:
             file_id = message.photo[-1].file_id
             media_type = "photo"
-            if not content: content = "[Фотография]"
+            if not content:
+                content = "[Фотография]"
         elif message.voice:
             file_id = message.voice.file_id
             media_type = "voice"
-            if not content: content = "[Голосовое сообщение]"
+            if not content:
+                content = "[Голосовое сообщение]"
         elif message.audio:
             file_id = message.audio.file_id
             media_type = "audio"
-            if not content: content = f"[Аудиозапись: {message.audio.title or 'без названия'}]"
+            if not content:
+                content = f"[Аудиозапись: {message.audio.title or 'без названия'}]"
         elif message.video_note:
             file_id = message.video_note.file_id
             media_type = "video_note"
-            if not content: content = "[Видеосообщение (кружочек)]"
+            if not content:
+                content = "[Видеосообщение (кружочек)]"
         elif message.video:
             file_id = message.video.file_id
             media_type = "video"
-            if not content: content = "[Видео]"
+            if not content:
+                content = "[Видео]"
         elif message.sticker:
             file_id = message.sticker.file_id
             media_type = "sticker"
-            if not content: content = f"[Стикер: {message.sticker.emoji or ''}]"
+            if not content:
+                content = f"[Стикер: {message.sticker.emoji or ''}]"
         elif message.document:
             file_id = message.document.file_id
             media_type = "document"
-            if not content: content = f"[Документ: {message.document.file_name or 'файл'}]"
+            if not content:
+                content = f"[Документ: {message.document.file_name or 'файл'}]"
 
         sender = message.from_user.full_name if message.from_user else "Собеседник"
         username = f"@{message.from_user.username}" if message.from_user and message.from_user.username else "@нет_юзернейма"
@@ -125,6 +138,7 @@ async def handle_business_message(message: types.Message):
         logging.error(f"Ошибка в handle_business_message: {e}")
 
 
+# 3. Обработка удаления сообщений
 @dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted):
     logging.info(f"[УДАЛЕНИЕ] Обнаружено событие удаления ID: {event.message_ids}")
@@ -166,7 +180,6 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                         logging.warning(f"[ОШИБКА] Не удалось найти владельца аккаунта для сообщения {msg_id}")
                         continue
 
-                    # Удаление до отправки ответа
                     await db_conn.execute("DELETE FROM messages WHERE message_id = ? AND chat_id = ?", (msg_id, event.chat.id))
                     await db_conn.commit()
 
@@ -200,7 +213,7 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                         logging.error(f"Не удалось отправить логи пользователю {target_user_id}: {send_error}")
 
                 else:
-                    logging.warning(f"[БАЗА] Сообщение ID {msg_id} не найдено или обработано ранее")
+                    logging.warning(f"[БАЗА] Сообщение ID {msg_id} не найдено в базе данных")
     except Exception as e:
         logging.error(f"Ошибка при обработке удаления: {e}")
 
@@ -222,9 +235,20 @@ async def start_web_server():
 async def main():
     await init_db()
     await start_web_server()
+    
+    # 1. Принудительно отключаем вебхук и сбрасываем очереди обновлений
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # 2. Небольшая пауза, чтобы серверы Telegram успели закрыть прошлые соединения
+    await asyncio.sleep(2)
+    
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        # 3. Запуск опроса с автоматической очисткой обработчиков
+        await dp.start_polling(
+            bot, 
+            allowed_updates=dp.resolve_used_update_types(),
+            close_bot_skip_unhandled=True
+        )
     finally:
         if db_conn:
             await db_conn.close()
