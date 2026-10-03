@@ -2,10 +2,12 @@ import logging
 import asyncio
 import aiosqlite
 import random
+import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web
 
 # ========================================================
 # ⚠️ ОБЯЗАТЕЛЬНО ВСТАВЬТЕ СВОЙ ТОКЕН НИЖЕ В КАВЫЧКАХ!
@@ -49,12 +51,8 @@ def check_winner(b):
         return 'Ничья'
     return None
 
-# ========================================================
-# КОМАНДА /START (При первом запуске бота пользователем)
-# ========================================================
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    # Ваш кастомный текст приветствия
     welcome_text = (
         "привет это мой собственный бот который работает на бесплатном хосте так что не надейтесь на хорошую работу\n\n"
         "🛠 **Доступные команды в чатах:**\n"
@@ -63,9 +61,6 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(welcome_text)
 
-# ========================================================
-# ОБРАБОТКА БИЗНЕС-СООБЩЕНИЙ И КОМАНД
-# ========================================================
 @dp.business_message()
 async def handle_business_message(message: types.Message):
     try:
@@ -120,9 +115,6 @@ async def handle_business_message(message: types.Message):
     except Exception as e:
         logging.error(f"Ошибка в handle_business_message: {e}")
 
-# ========================================================
-# ОБРАБОТКА НАЖАТИЙ НА КНОПКИ В ИГРЕ
-# ========================================================
 @dp.callback_query(lambda c: c.data.startswith('ttt_'))
 async def process_ttt_move(callback_query: types.CallbackQuery):
     chat_id = callback_query.message.chat.id
@@ -145,7 +137,7 @@ async def process_ttt_move(callback_query: types.CallbackQuery):
         await callback_query.answer("Вы не участвуете в этой дуэли!", show_alert=True)
         return
 
-    if clicker_id != game["turn"]:
+    if clicker_id != game["turn"] and game["turn"] is not None:
         await callback_query.answer("Сейчас не ваш ход!", show_alert=True)
         return
 
@@ -155,7 +147,7 @@ async def process_ttt_move(callback_query: types.CallbackQuery):
 
     if clicker_id == game["player_x"]:
         board[index] = '❌'
-        game["turn"] = game["player_o"] if game["player_o"] else "any_o"
+        game["turn"] = game["player_o"]
         next_turn_name = game["o_name"]
     else:
         board[index] = '⭕'
@@ -179,30 +171,11 @@ async def process_ttt_move(callback_query: types.CallbackQuery):
         del pvp_games[chat_id]
         return
 
-    status_text = f"🎮 **Крестики-Нолики (PvP)!**\n\n❌ Игрок 1: {game['x_name']}\n⭕ Игрок 2: {game['o_name']}\n\n👉 Сейчас очередь: **{next_turn_name if next_turn_name != 'any_o' else 'Второго игрока'}**"
-    
-    if game["turn"] == "any_o":
-        game["turn"] = None 
-
+    status_text = f"🎮 **Крестики-Нолики (PvP)!**\n\n❌ Игрок 1: {game['x_name']}\n⭕ Игрок 2: {game['o_name']}\n\n👉 Сейчас очередь: **{next_turn_name}**"
     try:
         await bot.edit_message_text(text=status_text, chat_id=chat_id, message_id=callback_query.message.message_id, reply_markup=get_ttt_keyboard(board))
     except Exception: pass
 
-@dp.callback_query(lambda c: c.data.startswith('ttt_') and pvp_games.get(c.message.chat.id, {}).get("turn") is None)
-async def process_ttt_free_join(callback_query: types.CallbackQuery):
-    chat_id = callback_query.message.chat.id
-    clicker_id = callback_query.from_user.id
-    game = pvp_games.get(chat_id)
-
-    if game and clicker_id != game["player_x"]:
-        game["player_o"] = clicker_id
-        game["o_name"] = callback_query.from_user.first_name
-        game["turn"] = clicker_id
-        await process_ttt_move(callback_query)
-
-# ========================================================
-# ОБРАБОТКА УДАЛЕНИЙ СООБЩЕНИЙ
-# ========================================================
 @dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted):
     try:
@@ -229,8 +202,25 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
     except Exception as e:
         logging.error(f"Ошибка при удалении: {e}")
 
+# --- ВЕБ-СЕРВЕР ДЛЯ ОБМАНА ХОСТИНГА RENDER ---
+async def handle_web_request(request):
+    return web.Response(text="Бот запущен и работает круглосуточно!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_web_request)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render передает номер порта в переменную окружения PORT
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Веб-сервер успешно запущен на порту {port}")
+
 async def main():
     await init_db()
+    # Запускаем фоновый веб-сервер вместе с ботом
+    await start_web_server()
     try:
         await dp.start_polling(bot)
     finally:
