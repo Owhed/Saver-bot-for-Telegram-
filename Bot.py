@@ -91,42 +91,42 @@ async def handle_business_message(message: types.Message):
         if message.photo:
             file_id = message.photo[-1].file_id
             media_type = "photo"
-            if not content:
-                content = "[Фотография]"
+            if not content: content = "[Фотография]"
         elif message.voice:
             file_id = message.voice.file_id
             media_type = "voice"
-            if not content:
-                content = "[Голосовое сообщение]"
+            if not content: content = "[Голосовое сообщение]"
         elif message.audio:
             file_id = message.audio.file_id
             media_type = "audio"
-            if not content:
-                content = f"[Аудиозапись: {message.audio.title or 'без названия'}]"
+            if not content: content = f"[Аудиозапись: {message.audio.title or 'без названия'}]"
         elif message.video_note:
             file_id = message.video_note.file_id
             media_type = "video_note"
-            if not content:
-                content = "[Видеосообщение (кружочек)]"
+            if not content: content = "[Видеосообщение (кружочек)]"
         elif message.video:
             file_id = message.video.file_id
             media_type = "video"
-            if not content:
-                content = "[Видео]"
+            if not content: content = "[Видео]"
         elif message.sticker:
             file_id = message.sticker.file_id
             media_type = "sticker"
-            if not content:
-                content = f"[Стикер: {message.sticker.emoji or ''}]"
+            if not content: content = f"[Стикер: {message.sticker.emoji or ''}]"
         elif message.document:
             file_id = message.document.file_id
             media_type = "document"
-            if not content:
-                content = f"[Документ: {message.document.file_name or 'файл'}]"
+            if not content: content = f"[Документ: {message.document.file_name or 'файл'}]"
 
         sender = message.from_user.full_name if message.from_user else "Собеседник"
         username = f"@{message.from_user.username}" if message.from_user and message.from_user.username else "@нет_юзернейма"
         conn_id = message.business_connection_id
+
+        # ФОЛЛБЕК: Если сообщения отправляет сам владелец бизнес-аккаунта (chat.id == from_user.id)
+        if conn_id and message.from_user and message.chat.id == message.from_user.id:
+            await db_conn.execute(
+                "INSERT OR REPLACE INTO connections (connection_id, owner_user_id) VALUES (?, ?)",
+                (conn_id, message.from_user.id)
+            )
 
         await db_conn.execute(
             "INSERT OR REPLACE INTO messages (message_id, chat_id, sender_name, username, text_content, file_id, media_type, connection_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
