@@ -203,11 +203,13 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-
-
 async def main():
     await init_db()
     await start_web_server()
+    
+    # Удаляем вебхук и сбрасываем зависшие обновления
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     try:
         await dp.start_polling(bot)
     finally:
