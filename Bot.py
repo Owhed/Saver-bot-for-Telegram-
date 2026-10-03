@@ -186,7 +186,7 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                     await db_conn.execute("DELETE FROM messages WHERE message_id = ? AND chat_id = ?", (msg_id, event.chat.id))
                     await db_conn.commit()
                 else:
-                    logging.warning(f"[БАЗА] Сообщение ID {msg_id} не найдено")
+                    logging.warning(f"[БАЗА] Сообщение ID {msg_id} не найдено в базе данных")
     except Exception as e:
         logging.error(f"Ошибка при обработке удаления: {e}")
 
@@ -203,15 +203,18 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
+
+
 async def main():
     await init_db()
     await start_web_server()
     
-    # Удаляем вебхук и сбрасываем зависшие обновления
+    # Сбрасываем возможные вебхуки и зависшие обновления
     await bot.delete_webhook(drop_pending_updates=True)
     
     try:
-        await dp.start_polling(bot)
+        # Явно передаем разрешенные типы событий (включая business_message и deleted_business_messages)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         if db_conn:
             await db_conn.close()
