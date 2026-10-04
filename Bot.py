@@ -61,6 +61,38 @@ async def cmd_start(message: types.Message):
     await message.answer(welcome_text, parse_mode="Markdown")
 
 
+# Вспомогательная функция для гарантированного получения и сохранения владельца
+async def ensure_connection_owner(connection_id: str) -> int | None:
+    if not connection_id:
+        return None
+
+    # Проверяем в локальной БД
+    async with db_conn.execute(
+        "SELECT owner_user_id FROM connections WHERE connection_id = ?",
+        (connection_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+
+    # Если в БД нет, запрашиваем напрямую у Telegram API
+    try:
+        conn_info = await bot.get_business_connection(business_connection_id=connection_id)
+        if conn_info and conn_info.user:
+            owner_id = conn_info.user.id
+            await db_conn.execute(
+                "INSERT OR REPLACE INTO connections (connection_id, owner_user_id) VALUES (?, ?)",
+                (connection_id, owner_id)
+            )
+            await db_conn.commit()
+            logging.info(f"[БИЗНЕС] Связь {connection_id} подтянута из API для пользователя {owner_id}")
+            return owner_id
+    except Exception as e:
+        logging.error(f"Не удалось получить бизнес-подключение {connection_id}: {e}")
+
+    return None
+
+
 # 1. Обработка подключения/отключения бота к Telegram Business
 @dp.business_connection()
 async def handle_business_connection(connection: types.BusinessConnection):
@@ -121,12 +153,9 @@ async def handle_business_message(message: types.Message):
         username = f"@{message.from_user.username}" if message.from_user and message.from_user.username else "@нет_юзернейма"
         conn_id = message.business_connection_id
 
-        # ФОЛЛБЕК: Если сообщения отправляет сам владелец бизнес-аккаунта (chat.id == from_user.id)
-        if conn_id and message.from_user and message.chat.id == message.from_user.id:
-            await db_conn.execute(
-                "INSERT OR REPLACE INTO connections (connection_id, owner_user_id) VALUES (?, ?)",
-                (conn_id, message.from_user.id)
-            )
+        # Автоматически проверяем и привязываем владельца при каждом сообщении
+        if conn_id:
+            await ensure_connection_owner(conn_id)
 
         await db_conn.execute(
             "INSERT OR REPLACE INTO messages (message_id, chat_id, sender_name, username, text_content, file_id, media_type, connection_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -144,16 +173,7 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
     logging.info(f"[УДАЛЕНИЕ] Обнаружено событие удаления ID: {event.message_ids}")
     try:
         conn_id = event.business_connection_id
-        owner_user_id = None
-
-        if conn_id:
-            async with db_conn.execute(
-                "SELECT owner_user_id FROM connections WHERE connection_id = ?",
-                (conn_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    owner_user_id = row[0]
+        owner_user_id = await ensure_connection_owner(conn_id) if conn_id else None
 
         unique_message_ids = set(event.message_ids)
 
@@ -168,18 +188,13 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
                     
                     target_user_id = owner_user_id
                     if not target_user_id and saved_conn_id:
-                        async with db_conn.execute(
-                            "SELECT owner_user_id FROM connections WHERE connection_id = ?",
-                            (saved_conn_id,)
-                        ) as c2:
-                            r2 = await c2.fetchone()
-                            if r2:
-                                target_user_id = r2[0]
+                        target_user_id = await ensure_connection_owner(saved_conn_id)
 
                     if not target_user_id:
                         logging.warning(f"[ОШИБКА] Не удалось найти владельца аккаунта для сообщения {msg_id}")
                         continue
 
+                    # Удаляем из БД сразу после нахождения
                     await db_conn.execute("DELETE FROM messages WHERE message_id = ? AND chat_id = ?", (msg_id, event.chat.id))
                     await db_conn.commit()
 
@@ -236,14 +251,11 @@ async def main():
     await init_db()
     await start_web_server()
     
-    # 1. Принудительно отключаем вебхук и сбрасываем очереди обновлений
+    # Отключаем вебхуки и делаем паузу для сброса старых сессий
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # 2. Небольшая пауза, чтобы серверы Telegram успели закрыть прошлые соединения
     await asyncio.sleep(2)
     
     try:
-        # 3. Запуск опроса с автоматической очисткой обработчиков
         await dp.start_polling(
             bot, 
             allowed_updates=dp.resolve_used_update_types(),
@@ -253,6 +265,9 @@ async def main():
         if db_conn:
             await db_conn.close()
 
+
+if __name__ == '__main__':
+    asyncio.run(main())
 
 if __name__ == '__main__':
     asyncio.run(main())
