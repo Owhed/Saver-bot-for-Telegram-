@@ -340,6 +340,8 @@ HELP_TEXT = (
     ".ttt stop — остановить игру\n"
     ".neko — случайная картинка с кошкодевочкой\n"
     ".duel — дуэль с собеседником, победителя решает случай\n"
+    ".text — расшифровать голосовое или кружок (ответом на него)\n"
+    ".song название или строчка — найти песню\n"
     ".bold — включить/выключить жирный шрифт\n"
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
@@ -480,6 +482,187 @@ async def handle_ttt_move(message: types.Message) -> bool:
     if result:
         GAMES.pop(game_key(message), None)
     return True
+
+
+# ---------- Расшифровка (.text) и поиск песен (.song) ----------
+
+# Распознавание речи: любой OpenAI-совместимый сервис (по умолчанию Groq, есть бесплатный лимит)
+STT_API_KEY = os.getenv("STT_API_KEY")
+STT_API_URL = os.getenv("STT_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
+STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
+# Токен Genius нужен для поиска песни по строчке из текста (https://genius.com/api-clients)
+GENIUS_TOKEN = os.getenv("GENIUS_TOKEN")
+
+
+async def notify_owner(owner_id: int, text: str):
+    """Отправляет результат владельцу в личку с ботом (собеседник его не увидит)."""
+    try:
+        for i in range(0, len(text), 4000):
+            await bot.send_message(chat_id=owner_id, text=text[i:i + 4000])
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение владельцу {owner_id}: {e}")
+
+
+async def transcribe(file_id: str, media_type: str) -> str:
+    if not STT_API_KEY:
+        raise RuntimeError("не задана переменная окружения STT_API_KEY")
+
+    tg_file = await bot.get_file(file_id)  # Bot API отдаёт файлы до 20 МБ
+    data = (await bot.download_file(tg_file.file_path)).read()
+
+    is_video = media_type == "video_note"
+    form = aiohttp.FormData()
+    form.add_field(
+        "file", data,
+        filename="audio.mp4" if is_video else "audio.ogg",
+        content_type="video/mp4" if is_video else "audio/ogg",
+    )
+    form.add_field("model", STT_MODEL)
+    form.add_field("response_format", "json")
+
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            STT_API_URL, data=form, headers={"Authorization": f"Bearer {STT_API_KEY}"}
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"сервис распознавания ответил {resp.status}: {(await resp.text())[:200]}")
+            result = await resp.json(content_type=None)
+    return (result.get("text") or "").strip()
+
+
+async def find_voice_target(message: types.Message):
+    """Ищем голосовое/кружок: сначала в сообщении, на которое ответили, затем последнее в чате."""
+    reply = message.reply_to_message
+    if reply:
+        _, file_id, media_type = extract_content(reply)
+        if file_id and media_type in ("voice", "video_note"):
+            return file_id, media_type
+
+    async with db_conn.execute(
+        "SELECT file_id, media_type FROM messages "
+        "WHERE chat_id = ? AND media_type IN ('voice', 'video_note') "
+        "ORDER BY message_id DESC LIMIT 1",
+        (message.chat.id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    return (row[0], row[1]) if row else None
+
+
+async def handle_text_command(message: types.Message, owner_id: int):
+    conn_id = message.business_connection_id
+    chat = message.chat
+    chat_name = getattr(chat, "full_name", None) or chat.first_name or "собеседник"
+
+    target = await find_voice_target(message)
+    await try_delete_message(conn_id, message.message_id)
+
+    if not target:
+        await notify_owner(owner_id, "🎙 Не нашёл голосового или кружка. Ответьте командой .text на нужное сообщение.")
+        return
+
+    try:
+        text = await transcribe(*target)
+    except Exception as e:
+        logging.error(f"[TEXT] Ошибка расшифровки: {e}")
+        await notify_owner(owner_id, f"❌ Не удалось расшифровать: {e}")
+        return
+
+    await notify_owner(owner_id, f"📝 Расшифровка (чат с {chat_name}):\n\n{text or '[речь не распознана]'}")
+
+
+async def search_genius(query: str) -> list[tuple[str, str, str]]:
+    if not GENIUS_TOKEN:
+        return []
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://api.genius.com/search",
+                params={"q": query},
+                headers={"Authorization": f"Bearer {GENIUS_TOKEN}"},
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+        hits = data.get("response", {}).get("hits", [])[:5]
+        return [
+            (h["result"]["primary_artist"]["name"], h["result"]["title"], h["result"]["url"])
+            for h in hits
+        ]
+    except Exception as e:
+        logging.warning(f"[SONG] Genius не ответил: {e}")
+        return []
+
+
+async def search_deezer(query: str) -> list[dict]:
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://api.deezer.com/search", params={"q": query, "limit": 5}
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+        return data.get("data", [])[:5]
+    except Exception as e:
+        logging.warning(f"[SONG] Deezer не ответил: {e}")
+        return []
+
+
+async def handle_song_command(message: types.Message, owner_id: int, args: str):
+    conn_id = message.business_connection_id
+    query = args.strip()
+    reply = message.reply_to_message
+
+    # Без текста команды берём запрос из сообщения, на которое ответили
+    if not query and reply:
+        query = (reply.text or reply.caption or "").strip()
+        if not query:
+            _, file_id, media_type = extract_content(reply)
+            if file_id and media_type in ("voice", "video_note"):
+                try:
+                    query = await transcribe(file_id, media_type)  # ищем по произнесённой строчке
+                except Exception as e:
+                    await try_delete_message(conn_id, message.message_id)
+                    await notify_owner(owner_id, f"❌ Не удалось расшифровать голосовое для поиска: {e}")
+                    return
+
+    await try_delete_message(conn_id, message.message_id)
+
+    if not query:
+        await notify_owner(owner_id, "🎵 Напишите название или строчку из песни: .song название")
+        return
+
+    genius, deezer = await asyncio.gather(search_genius(query), search_deezer(query))
+
+    lines = [f"🎵 Поиск: {query[:200]}"]
+    if genius:
+        lines.append("\n📖 Genius (в том числе по тексту):")
+        for i, (artist, title, url) in enumerate(genius, 1):
+            lines.append(f"{i}. {artist} — {title}\n{url}")
+    if deezer:
+        lines.append("\n🎧 Deezer:")
+        for i, t in enumerate(deezer, 1):
+            lines.append(f"{i}. {t['artist']['name']} — {t['title']}\n{t['link']}")
+    if not genius and not deezer:
+        lines.append("\nНичего не найдено 😔")
+    if not GENIUS_TOKEN:
+        lines.append("\nℹ️ Для поиска по строчке из текста добавьте переменную GENIUS_TOKEN.")
+
+    await notify_owner(owner_id, "\n".join(lines))
+
+    # Отрывок первого трека (30 сек от Deezer)
+    if deezer and deezer[0].get("preview"):
+        top = deezer[0]
+        try:
+            await bot.send_audio(
+                chat_id=owner_id, audio=top["preview"],
+                title=top["title"], performer=top["artist"]["name"],
+            )
+        except Exception as e:
+            logging.info(f"[SONG] Не удалось отправить отрывок: {e}")
 
 
 # ---------- Дуэль (.duel) ----------
@@ -743,7 +926,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -770,6 +953,15 @@ async def handle_help_and_games(message: types.Message) -> bool:
     if command == ".duel":
         if message.chat.id != owner_id:
             await run_duel(message)
+        return True
+
+    if command == ".text":
+        await handle_text_command(message, owner_id)
+        return True
+
+    if command == ".song":
+        args = text.split(None, 1)[1] if len(parts) > 1 else ""
+        await handle_song_command(message, owner_id, args)
         return True
 
     if command in FORMAT_COMMANDS:
