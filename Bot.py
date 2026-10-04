@@ -9,7 +9,7 @@ import re
 import tempfile
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile, FSInputFile
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
 from aiohttp import web
@@ -123,13 +123,19 @@ async def init_db():
 async def cmd_start(message: types.Message):
     welcome_text = (
         "👋 Привет!\n\n"
-        "Я бот для сохранения удалённых сообщений из <b>Telegram Business</b>.\n\n"
-        "1️⃣ Подключите меня в <b>Настройки ➔ Telegram Business ➔ Чат-боты</b>.\n"
-        "2️⃣ Все удалённые сообщения и медиафайлы из ваших бизнес-чатов будут приходить прямо сюда!\n\n"
+        "Я бот для сохранения удалённых сообщений из <b>Telegram</b>.\n\n"
+        "1️⃣ Подключите меня: <b>Профиль ➔ Редактировать профиль ➔ внизу «Автоматизация чатов» ➔ напишите Owhedsavebot</b>.\n"
+        "2️⃣ Все удалённые сообщения и медиафайлы из ваших чатов будут приходить прямо сюда!\n\n"
+        "Список команд: /help\n\n"
         "Мой ТГК @rebfa\n"
         "поддержать: <code>UQDT1kkEirbQOmUlfvc9AX5LaKZUDteRw44uRQg_xOtpAOjc</code>"
     )
     await message.answer(welcome_text, parse_mode="HTML")
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(HELP_TEXT, parse_mode=None)
 
 
 def get_owner_chat_id(conn_info: types.BusinessConnection) -> int:
@@ -1517,6 +1523,11 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("1.2.0", [
+        "👋 Новое приветствие: обновлена инструкция по подключению",
+        "📋 Команда /help в личке с ботом показывает список команд",
+        "🔕 Бот больше не пишет об отключении",
+    ]),
     ("1.1.0", [
         "🔇 .mute теперь предупреждает собеседника в чате, а .unmute сообщает, что ограничение снято",
         "📣 После каждого обновления бот присылает список изменений",
@@ -1597,10 +1608,6 @@ async def main():
             close_bot_session=False,  # сессию закроем сами, после уведомления об остановке
         )
     finally:
-        await notify_all_owners(
-            "🔧 Бот ушёл на тех. работы.\n"
-            "Пока он выключен, сообщения не сохраняются и команды не работают. Напишу, когда вернусь."
-        )
         await runner.cleanup()
         if db_conn:
             await db_conn.close()
