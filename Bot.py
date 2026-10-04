@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
+import aiohttp
 from aiohttp import web
 
 # ========================================================
@@ -318,6 +319,7 @@ HELP_TEXT = (
     ".kawaii текст — пикми-режим\n"
     ".ttt — крестики-нолики с собеседником (ходы цифрами 1–9)\n"
     ".ttt stop — остановить игру\n"
+    ".neko — случайная картинка с кошкодевочкой\n"
     ".help — этот список"
 )
 
@@ -456,6 +458,57 @@ async def handle_ttt_move(message: types.Message) -> bool:
     return True
 
 
+# Только SFW-источники картинок
+NEKO_APIS = [
+    ("https://nekos.best/api/v2/neko", lambda d: d["results"][0]["url"]),
+    ("https://api.waifu.pics/sfw/neko", lambda d: d["url"]),
+]
+
+
+async def fetch_neko_url() -> str | None:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for api_url, extract in random.sample(NEKO_APIS, len(NEKO_APIS)):
+            try:
+                async with session.get(api_url) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+                    return extract(data)
+            except Exception as e:
+                logging.warning(f"[NEKO] Источник {api_url} не ответил: {e}")
+    return None
+
+
+async def send_neko(message: types.Message):
+    conn_id = message.business_connection_id
+    chat_id = message.chat.id
+
+    url = await fetch_neko_url()
+    if not url:
+        logging.error("[NEKO] Не удалось получить картинку ни из одного источника")
+        return
+
+    is_gif = url.lower().endswith(".gif")
+    sender = bot.send_animation if is_gif else bot.send_photo
+    arg = "animation" if is_gif else "photo"
+
+    try:
+        # Пробуем отправить по ссылке — Telegram сам скачает файл
+        await sender(chat_id=chat_id, business_connection_id=conn_id, **{arg: url})
+    except Exception as e:
+        logging.info(f"[NEKO] Отправка по ссылке не удалась ({e}), скачиваю файл сам")
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                data = await resp.read()
+        upload = BufferedInputFile(data, filename="neko.gif" if is_gif else "neko.jpg")
+        await sender(chat_id=chat_id, business_connection_id=conn_id, **{arg: upload})
+
+    # Убираем сообщение-команду
+    await try_delete_message(conn_id, message.message_id)
+
+
 async def handle_help_and_games(message: types.Message) -> bool:
     text = message.text
     conn_id = message.business_connection_id
@@ -467,7 +520,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt"):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko"):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -485,6 +538,10 @@ async def handle_help_and_games(message: types.Message) -> bool:
             )
         except Exception as e:
             logging.error(f"Не удалось показать .help: {e}")
+        return True
+
+    if command == ".neko":
+        await send_neko(message)
         return True
 
     # .ttt
