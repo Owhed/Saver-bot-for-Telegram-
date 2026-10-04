@@ -373,8 +373,7 @@ HELP_TEXT = (
     ".unmute — снять запрет\n"
     ".song название или строчка — найти песню\n"
     ".spam число текст — отправить текст несколько раз (до 30)\n"
-    ".info — профиль собеседника в этот чат\n"
-    ".infop — профиль собеседника в личку с ботом\n"
+    ".love — анимация любви\n"
     ".bold — включить/выключить жирный шрифт\n"
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
@@ -1247,7 +1246,7 @@ async def send_neko(message: types.Message):
 
 
 SPAM_MAX = 30
-SPAM_DELAY = 0.6
+SPAM_DELAY = 0.4
 
 
 async def handle_spam_command(message: types.Message, owner_id: int, args: str):
@@ -1281,65 +1280,41 @@ async def handle_spam_command(message: types.Message, owner_id: int, args: str):
         await asyncio.sleep(SPAM_DELAY)
 
 
-async def handle_info_command(message: types.Message, owner_id: int, private: bool):
-    """.info — профиль собеседника в этот же чат, .infop — в личку с ботом. Только то, что Telegram отдаёт боту."""
+LOVE_FRAMES = [
+    "🤍",
+    "🤍🤍",
+    "💗💗💗",
+    "💗 💖 💗",
+    "💖💖💖💖💖",
+    "💘 💞 💘 💞 💘",
+    "💕💕💕💕💕💕💕",
+    "❤️‍🔥❤️‍🔥❤️‍🔥❤️‍🔥❤️‍🔥",
+    "💖 Я тебя люблю 💖",
+    "💞💖💘 Я тебя люблю 💘💖💞",
+    "💖💘💞💓💗 Я тебя люблю 💗💓💞💘💖",
+    "❤️ Я тебя люблю ❤️",
+]
+LOVE_DELAY = 0.5
+
+
+async def handle_love_command(message: types.Message):
+    """.love — анимация сердечек: редактируем команду кадр за кадром."""
     conn_id = message.business_connection_id
-    chat = message.chat
-    if chat.id == owner_id:
-        return  # чат с самим собой
-
-    try:
-        full = await bot.get_chat(chat.id)
-    except Exception as e:
-        logging.error(f"[INFO] get_chat не сработал: {e}")
-        full = None
-
-    src = full or chat
-    name = " ".join(x for x in (getattr(src, "first_name", None), getattr(src, "last_name", None)) if x) or "—"
-    username = getattr(src, "username", None)
-    lines = [
-        "👤 Профиль собеседника",
-        f"ID: {chat.id}",
-        f"Имя: {name}",
-        f"Юзернейм: {'@' + username if username else '—'}",
-    ]
-    extra = getattr(src, "active_usernames", None)
-    if extra and len(extra) > 1:
-        lines.append("Все юзернеймы: " + ", ".join("@" + u for u in extra))
-
-    bio = getattr(src, "bio", None)
-    if bio:
-        lines.append(f"О себе: {bio}")
-
-    bd = getattr(src, "birthdate", None)
-    if bd:
-        year = f".{bd.year}" if getattr(bd, "year", None) else ""
-        lines.append(f"День рождения: {bd.day:02d}.{bd.month:02d}{year}")
-
-    pc = getattr(src, "personal_chat", None)
-    if pc:
-        pc_name = f"@{pc.username}" if getattr(pc, "username", None) else (getattr(pc, "title", None) or str(pc.id))
-        lines.append(f"Личный канал в профиле: {pc_name}")
-
-    if full is None:
-        lines.append("(расширенные данные профиля получить не удалось)")
-    lines.append("")
-    lines.append("ℹ️ Группы и номер телефона Telegram боту не раскрывает.")
-    text = "\n".join(lines)
-
-    if private:
-        await try_delete_message(conn_id, message.message_id)
-        await notify_owner(owner_id, text)
-        return
-    try:
-        await bot.edit_message_text(
-            text=text,
-            business_connection_id=conn_id,
-            chat_id=chat.id,
-            message_id=message.message_id,
-        )
-    except Exception as e:
-        logging.error(f"[INFO] Не удалось показать .info: {e}")
+    chat_id = message.chat.id
+    for frame in LOVE_FRAMES:
+        try:
+            await bot.edit_message_text(
+                text=frame,
+                business_connection_id=conn_id,
+                chat_id=chat_id,
+                message_id=message.message_id,
+            )
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            logging.error(f"[LOVE] Остановлено: {e}")
+            return
+        await asyncio.sleep(LOVE_DELAY)
 
 
 async def handle_help_and_games(message: types.Message) -> bool:
@@ -1353,7 +1328,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".info", ".infop", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".love", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -1396,8 +1371,8 @@ async def handle_help_and_games(message: types.Message) -> bool:
         await handle_video_command(message, owner_id, args)
         return True
 
-    if command in (".info", ".infop"):
-        await handle_info_command(message, owner_id, private=(command == ".infop"))
+    if command == ".love":
+        await handle_love_command(message)
         return True
 
     if command == ".spam":
@@ -1632,8 +1607,9 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
-    ("1.2", [
-        "➕ Добавлены команды .info и .infop (профиль собеседника в чат / в личку)",
+    ("1.3", [
+        "💖 Добавлена команда .love — анимация любви",
+        "⚡ .spam стал быстрее",
     ]),
     ("1.1", [
         "➕ Добавлена команда .spam",
