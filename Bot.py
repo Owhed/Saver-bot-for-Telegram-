@@ -86,9 +86,6 @@ async def cmd_start(message: types.Message):
         "Я бот для сохранения удалённых сообщений из <b>Telegram Business</b>.\n\n"
         "1️⃣ Подключите меня в <b>Настройки ➔ Telegram Business ➔ Чат-боты</b>.\n"
         "2️⃣ Все удалённые сообщения и медиафайлы из ваших бизнес-чатов будут приходить прямо сюда!\n\n"
-        "✨ <b>Команды в бизнес-чатах:</b>\n"
-        "<code>.tsundere текст</code> — сообщение в стиле цундере\n"
-        "<code>.kawaii текст</code> — пикми-режим\n\n"
         "Мой ТГК @rebfa\n"
         "поддержать: <code>UQDT1kkEirbQOmUlfvc9AX5LaKZUDteRw44uRQg_xOtpAOjc</code>"
     )
@@ -313,6 +310,191 @@ async def handle_style_command(message: types.Message) -> bool:
     return True
 
 
+# ---------- .help и крестики-нолики (.ttt) ----------
+
+HELP_TEXT = (
+    "✨ Команды (работают в бизнес-чатах, только у владельца):\n\n"
+    ".tsundere текст — сообщение в стиле цундере\n"
+    ".kawaii текст — пикми-режим\n"
+    ".ttt — крестики-нолики с собеседником (ходы цифрами 1–9)\n"
+    ".ttt stop — остановить игру\n"
+    ".help — этот список"
+)
+
+# Активные игры: chat_id -> состояние (хранятся в памяти, при перезапуске бота сбрасываются)
+GAMES: dict[tuple, dict] = {}
+
+
+def game_key(message: types.Message) -> tuple:
+    """Ключ партии: (бизнес-подключение владельца, чат). Партии разных владельцев не пересекаются."""
+    return (message.business_connection_id, message.chat.id)
+
+WIN_LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+MARKS = {"X": "❌", "O": "⭕"}
+
+
+def check_winner(board: list[str]) -> str | None:
+    for a, b, c in WIN_LINES:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    if all(board):
+        return "draw"
+    return None
+
+
+def render_game(game: dict, result: str | None = None, note: str | None = None) -> str:
+    rows = []
+    for r in range(3):
+        row = ""
+        for c in range(3):
+            i = r * 3 + c
+            row += MARKS.get(game["board"][i], NUM_EMOJI[i])
+        rows.append(row)
+
+    names = {"X": game["x_name"], "O": game["o_name"]}
+    text = (
+        f"🎮 Крестики-нолики\n"
+        f"{MARKS['X']} {names['X']}  vs  {MARKS['O']} {names['O']}\n\n"
+        + "\n".join(rows) + "\n\n"
+    )
+    if note:
+        text += note
+    elif result == "draw":
+        text += "🤝 Ничья!"
+    elif result in MARKS:
+        text += f"🏆 Победил {MARKS[result]} {names[result]}!"
+    else:
+        text += f"Ход: {MARKS[game['turn']]} {names[game['turn']]}\nОтправьте цифру от 1 до 9"
+    return text
+
+
+async def update_board(game: dict, chat_id: int, text: str):
+    """Редактирует сообщение с доской; если не вышло — отправляет новое."""
+    try:
+        await bot.edit_message_text(
+            text=text,
+            business_connection_id=game["conn_id"],
+            chat_id=chat_id,
+            message_id=game["msg_id"],
+        )
+    except Exception as e:
+        logging.warning(f"[ИГРА] Не удалось изменить доску ({e}), отправляю новое сообщение")
+        sent = await bot.send_message(
+            chat_id=chat_id, text=text, business_connection_id=game["conn_id"]
+        )
+        game["msg_id"] = sent.message_id
+
+
+async def start_ttt(message: types.Message, owner_id: int):
+    chat_id = message.chat.id
+    if chat_id == owner_id:
+        return  # с самим собой играть нельзя
+
+    chat = message.chat
+    opponent_name = getattr(chat, "full_name", None) or chat.first_name or "Собеседник"
+    game = {
+        "board": [""] * 9,
+        "turn": "X",
+        "x_id": owner_id,
+        "o_id": chat_id,
+        "x_name": message.from_user.full_name,
+        "o_name": opponent_name,
+        "msg_id": message.message_id,  # команда .ttt превращается в доску
+        "conn_id": message.business_connection_id,
+    }
+    GAMES[game_key(message)] = game
+    await update_board(game, chat_id, render_game(game))
+    logging.info(f"[ИГРА] Начата партия в чате {chat_id}")
+
+
+async def stop_ttt(message: types.Message):
+    game = GAMES.pop(game_key(message), None)
+    if game:
+        await update_board(game, message.chat.id, render_game(game, note="🛑 Игра остановлена"))
+    # Само сообщение-команду убираем, чтобы не мусорило в чате
+    await try_delete_message(message.business_connection_id, message.message_id)
+
+
+async def try_delete_message(conn_id: str, message_id: int):
+    try:
+        await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message_id])
+    except Exception as e:
+        logging.info(f"[ИГРА] Не удалось удалить сообщение {message_id}: {e}")
+
+
+async def handle_ttt_move(message: types.Message) -> bool:
+    game = GAMES.get(game_key(message))
+    if not game or not message.text or message.business_connection_id != game["conn_id"]:
+        return False
+
+    move = message.text.strip()
+    if len(move) != 1 or move not in "123456789":
+        return False
+
+    sender_id = message.from_user.id if message.from_user else None
+    if sender_id == game["x_id"]:
+        mark = "X"
+    elif sender_id == game["o_id"]:
+        mark = "O"
+    else:
+        return False
+
+    idx = int(move) - 1
+    if mark != game["turn"] or game["board"][idx]:
+        return False  # не ваш ход или клетка занята — обычное сообщение
+
+    game["board"][idx] = mark
+    result = check_winner(game["board"])
+    game["turn"] = "O" if mark == "X" else "X"
+
+    await update_board(game, message.chat.id, render_game(game, result=result))
+    await try_delete_message(message.business_connection_id, message.message_id)
+
+    if result:
+        GAMES.pop(game_key(message), None)
+    return True
+
+
+async def handle_help_and_games(message: types.Message) -> bool:
+    text = message.text
+    conn_id = message.business_connection_id
+    if not text or not conn_id:
+        return False
+
+    # Ходы в игре (от владельца и собеседника)
+    if game_key(message) in GAMES and await handle_ttt_move(message):
+        return True
+
+    parts = text.split()
+    if not parts or parts[0].lower() not in (".help", ".ttt"):
+        return False
+
+    owner_id = await ensure_connection_owner(conn_id)
+    if not message.from_user or message.from_user.id != owner_id:
+        return False  # команды только у владельца
+
+    command = parts[0].lower()
+    if command == ".help":
+        try:
+            await bot.edit_message_text(
+                text=HELP_TEXT,
+                business_connection_id=conn_id,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+        except Exception as e:
+            logging.error(f"Не удалось показать .help: {e}")
+        return True
+
+    # .ttt
+    if len(parts) > 1 and parts[1].lower() in ("stop", "end", "стоп"):
+        await stop_ttt(message)
+    else:
+        await start_ttt(message, owner_id)
+    return True
+
+
 # 2. Входящие бизнес-сообщения
 @dp.business_message()
 async def handle_business_message(message: types.Message):
@@ -321,6 +503,12 @@ async def handle_business_message(message: types.Message):
             return
     except Exception as e:
         logging.error(f"Ошибка в handle_style_command: {e}")
+
+    try:
+        if await handle_help_and_games(message):
+            return
+    except Exception as e:
+        logging.error(f"Ошибка в handle_help_and_games: {e}")
 
     logging.info(
         f"[ВХОДЯЩЕЕ] id={message.message_id} type={message.content_type} "
