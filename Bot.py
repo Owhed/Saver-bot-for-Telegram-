@@ -9,6 +9,7 @@ import re
 import tempfile
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile, FSInputFile
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
@@ -371,6 +372,7 @@ HELP_TEXT = (
     ".mute — не давать собеседнику писать (его сообщения удаляются)\n"
     ".unmute — снять запрет\n"
     ".song название или строчка — найти песню\n"
+    ".spam число текст — отправить текст несколько раз (до 30)\n"
     ".bold — включить/выключить жирный шрифт\n"
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
@@ -1242,6 +1244,41 @@ async def send_neko(message: types.Message):
     await try_delete_message(conn_id, message.message_id)
 
 
+SPAM_MAX = 30
+SPAM_DELAY = 0.6
+
+
+async def handle_spam_command(message: types.Message, owner_id: int, args: str):
+    """.spam число текст — отправляет текст указанное число раз."""
+    conn_id = message.business_connection_id
+    chat_id = message.chat.id
+    parts = args.split(None, 1)
+
+    if len(parts) < 2 or not parts[0].isdigit() or int(parts[0]) < 1:
+        await try_delete_message(conn_id, message.message_id)
+        await notify_owner(owner_id, f"📨 Формат: .spam число текст (например, .spam 5 привет). Максимум {SPAM_MAX}.")
+        return
+
+    count = min(int(parts[0]), SPAM_MAX)
+    spam_text = parts[1]
+
+    await try_delete_message(conn_id, message.message_id)
+    for _ in range(count):
+        try:
+            await bot.send_message(chat_id=chat_id, text=spam_text, business_connection_id=conn_id, parse_mode=None)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.send_message(chat_id=chat_id, text=spam_text, business_connection_id=conn_id, parse_mode=None)
+            except Exception as e2:
+                logging.error(f"[SPAM] Остановлено: {e2}")
+                break
+        except Exception as e:
+            logging.error(f"[SPAM] Остановлено: {e}")
+            break
+        await asyncio.sleep(SPAM_DELAY)
+
+
 async def handle_help_and_games(message: types.Message) -> bool:
     text = message.text
     conn_id = message.business_connection_id
@@ -1253,7 +1290,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", ".mute", ".unmute", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", ".mute", ".unmute", ".spam", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -1294,6 +1331,11 @@ async def handle_help_and_games(message: types.Message) -> bool:
     if command == ".video":
         args = text.split(None, 1)[1] if len(parts) > 1 else ""
         await handle_video_command(message, owner_id, args)
+        return True
+
+    if command == ".spam":
+        args = text.split(None, 1)[1] if len(parts) > 1 else ""
+        await handle_spam_command(message, owner_id, args)
         return True
 
     if command in (".mute", ".unmute"):
@@ -1527,6 +1569,7 @@ CHANGELOG = [
         "👋 Новое приветствие: обновлена инструкция по подключению",
         "📋 Команда /help в личке с ботом показывает список команд",
         "🔕 Бот больше не пишет об отключении",
+        "📨 Новая команда .spam число текст",
     ]),
     ("1.1.0", [
         "🔇 .mute теперь предупреждает собеседника в чате, а .unmute сообщает, что ограничение снято",
