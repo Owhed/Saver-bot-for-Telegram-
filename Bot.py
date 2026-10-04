@@ -211,6 +211,10 @@ async def handle_business_connection(connection: types.BusinessConnection):
 # 2. Входящие бизнес-сообщения
 @dp.business_message()
 async def handle_business_message(message: types.Message):
+    logging.info(
+        f"[ВХОДЯЩЕЕ] id={message.message_id} type={message.content_type} "
+        f"reply={'да' if message.reply_to_message else 'нет'}"
+    )
     try:
         await save_message(message)
     except Exception as e:
@@ -247,6 +251,7 @@ async def send_deleted_notice(target_id: int, text: str, file_id: str | None, me
 
 
 ONE_TIME_TYPES = {"photo", "video", "voice", "video_note"}
+ONLY_OWNER_REPLIES = True  # True: только когда отвечаете вы; False: на любой ответ в чате
 
 
 async def forward_one_time_media(message: types.Message):
@@ -260,19 +265,20 @@ async def forward_one_time_media(message: types.Message):
         return
 
     content, file_id, media_type = extract_content(reply)
+    logging.info(
+        f"[ОТВЕТ] reply_to={reply.message_id} media_type={media_type} "
+        f"has_file={bool(file_id)} content_type={reply.content_type}"
+    )
     if not file_id or media_type not in ONE_TIME_TYPES:
         return
 
     chat_id = message.chat.id
 
-    # Если медиа мы уже видели обычным сообщением — оно не одноразовое
-    async with db_conn.execute(
-        "SELECT file_id FROM messages WHERE message_id = ? AND chat_id = ?",
-        (reply.message_id, chat_id)
-    ) as cursor:
-        cached = await cursor.fetchone()
-    if cached and cached[0]:
-        return
+    # Реагируем только на ответы самого владельца (иначе будет спам копиями)
+    if ONLY_OWNER_REPLIES:
+        owner_check = await ensure_connection_owner(conn_id)
+        if not message.from_user or message.from_user.id != owner_check:
+            return
 
     # Уже отправляли это медиа раньше
     async with db_conn.execute(
