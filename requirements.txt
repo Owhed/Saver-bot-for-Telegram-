@@ -2,3 +2,4 @@ aiogram
 aiosqlite
 aiohttp
    yt-dlp[default,curl-cffi]
+Pillow
