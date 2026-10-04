@@ -76,6 +76,14 @@ async def init_db():
         )
     ''')
 
+    # Включённые стили оформления для каждого владельца
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS formats (
+            connection_id TEXT PRIMARY KEY,
+            styles TEXT
+        )
+    ''')
+
     await db_conn.commit()
     logging.info("База данных SQLite успешно запущена!")
 
@@ -320,6 +328,10 @@ HELP_TEXT = (
     ".ttt — крестики-нолики с собеседником (ходы цифрами 1–9)\n"
     ".ttt stop — остановить игру\n"
     ".neko — случайная картинка с кошкодевочкой\n"
+    ".bold — включить/выключить жирный шрифт\n"
+    ".italic — включить/выключить курсив\n"
+    ".monospace — включить/выключить моноширинный шрифт\n"
+    ".underline — включить/выключить подчёркивание\n"
     ".help — этот список"
 )
 
@@ -458,6 +470,122 @@ async def handle_ttt_move(message: types.Message) -> bool:
     return True
 
 
+# ---------- Авто-форматирование: .bold .italic .monospace .underline ----------
+
+FORMAT_COMMANDS = {
+    ".bold": "bold",
+    ".italic": "italic",
+    ".monospace": "monospace",
+    ".underline": "underline",
+}
+FORMAT_LABELS = {
+    "bold": "Жирный",
+    "italic": "Курсив",
+    "monospace": "Моноширинный",
+    "underline": "Подчёркнутый",
+}
+FORMAT_ENTITY = {"bold": "bold", "italic": "italic", "monospace": "code", "underline": "underline"}
+FORMAT_CACHE: dict[str, set] = {}
+
+
+async def get_styles(conn_id: str) -> set:
+    if conn_id in FORMAT_CACHE:
+        return FORMAT_CACHE[conn_id]
+    async with db_conn.execute(
+        "SELECT styles FROM formats WHERE connection_id = ?", (conn_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    styles = {x for x in (row[0] if row and row[0] else "").split(",") if x in FORMAT_ENTITY}
+    FORMAT_CACHE[conn_id] = styles
+    return styles
+
+
+async def save_styles(conn_id: str, styles: set):
+    FORMAT_CACHE[conn_id] = styles
+    await db_conn.execute(
+        "INSERT OR REPLACE INTO formats (connection_id, styles) VALUES (?, ?)",
+        (conn_id, ",".join(sorted(styles)))
+    )
+    await db_conn.commit()
+
+
+async def toggle_format(message: types.Message, owner_id: int, style: str):
+    conn_id = message.business_connection_id
+    styles = set(await get_styles(conn_id))
+    if style in styles:
+        styles.discard(style)
+        enabled = False
+    else:
+        styles.add(style)
+        enabled = True
+    await save_styles(conn_id, styles)
+
+    # Команду убираем из чата, а подтверждение шлём владельцу в личку с ботом
+    await try_delete_message(conn_id, message.message_id)
+
+    active = ", ".join(FORMAT_LABELS[x] for x in sorted(styles)) or "нет"
+    note = f"{'✅ Включено' if enabled else '❌ Выключено'}: {FORMAT_LABELS[style]}\nАктивные стили: {active}"
+    if "monospace" in styles and len(styles) > 1:
+        note += "\n⚠️ Моноширинный нельзя сочетать с другими стилями — пока он включён, применяется только он."
+    try:
+        await bot.send_message(chat_id=owner_id, text=note)
+    except Exception as e:
+        logging.info(f"[ФОРМАТ] Не удалось отправить подтверждение владельцу: {e}")
+
+
+async def apply_auto_format(message: types.Message):
+    """Оформляет каждое сообщение владельца включёнными стилями."""
+    conn_id = message.business_connection_id
+    if not conn_id or not message.from_user:
+        return
+
+    text = message.text or message.caption
+    if not text or not text.strip():
+        return
+
+    styles = await get_styles(conn_id)
+    if not styles:
+        return
+
+    owner_id = await ensure_connection_owner(conn_id)
+    if message.from_user.id != owner_id:
+        return
+
+    is_caption = message.text is None
+    existing = list((message.caption_entities if is_caption else message.entities) or [])
+
+    # Код/pre нельзя совмещать с другими стилями — не трогаем такие сообщения
+    if any(e.type in ("code", "pre") for e in existing):
+        return
+
+    if "monospace" in styles:
+        if existing:
+            return  # моноширинный не совмещается со ссылками, упоминаниями и т.п.
+        entity_types = ["code"]
+    else:
+        entity_types = [FORMAT_ENTITY[x] for x in sorted(styles)]
+
+    length = len(text.encode("utf-16-le")) // 2  # Telegram считает в UTF-16
+    new_entities = [types.MessageEntity(type=t, offset=0, length=length) for t in entity_types]
+    entities = existing + new_entities
+
+    try:
+        if is_caption:
+            await bot.edit_message_caption(
+                caption=text, caption_entities=entities,
+                business_connection_id=conn_id, chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+        else:
+            await bot.edit_message_text(
+                text=text, entities=entities,
+                business_connection_id=conn_id, chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+    except Exception as e:
+        logging.error(f"[ФОРМАТ] Не удалось оформить сообщение {message.message_id}: {e}")
+
+
 # Только SFW-источники картинок
 NEKO_APIS = [
     ("https://nekos.best/api/v2/neko", lambda d: d["results"][0]["url"]),
@@ -520,7 +648,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko"):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -544,6 +672,12 @@ async def handle_help_and_games(message: types.Message) -> bool:
         await send_neko(message)
         return True
 
+    if command in FORMAT_COMMANDS:
+        if len(parts) == 1:  # переключатель — только когда сообщение состоит из одной команды
+            await toggle_format(message, owner_id, FORMAT_COMMANDS[command])
+            return True
+        return False
+
     # .ttt
     if len(parts) > 1 and parts[1].lower() in ("stop", "end", "стоп"):
         await stop_ttt(message)
@@ -566,6 +700,11 @@ async def handle_business_message(message: types.Message):
             return
     except Exception as e:
         logging.error(f"Ошибка в handle_help_and_games: {e}")
+
+    try:
+        await apply_auto_format(message)
+    except Exception as e:
+        logging.error(f"Ошибка в apply_auto_format: {e}")
 
     logging.info(
         f"[ВХОДЯЩЕЕ] id={message.message_id} type={message.content_type} "
