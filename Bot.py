@@ -629,9 +629,8 @@ async def handle_song_command(message: types.Message, owner_id: int, args: str):
                     await notify_owner(owner_id, f"❌ Не удалось расшифровать голосовое для поиска: {e}")
                     return
 
-    await try_delete_message(conn_id, message.message_id)
-
     if not query:
+        await try_delete_message(conn_id, message.message_id)
         await notify_owner(owner_id, "🎵 Напишите название или строчку из песни: .song название")
         return
 
@@ -649,16 +648,33 @@ async def handle_song_command(message: types.Message, owner_id: int, args: str):
     if not genius and not deezer:
         lines.append("\nНичего не найдено 😔")
     if not GENIUS_TOKEN:
-        lines.append("\nℹ️ Для поиска по строчке из текста добавьте переменную GENIUS_TOKEN.")
+        logging.info("[SONG] GENIUS_TOKEN не задан — поиск по строчке из текста недоступен")
+    result_text = "\n".join(lines)[:4000]
 
-    await notify_owner(owner_id, "\n".join(lines))
+    chat_id = message.chat.id
 
-    # Отрывок первого трека (30 сек от Deezer)
+    # Результат уходит в чат, где написана команда: сообщение-команда превращается в результат
+    try:
+        await bot.edit_message_text(
+            text=result_text, business_connection_id=conn_id,
+            chat_id=chat_id, message_id=message.message_id,
+        )
+    except Exception as e:
+        logging.info(f"[SONG] Не удалось изменить сообщение ({e}), отправляю новое")
+        try:
+            await bot.send_message(chat_id=chat_id, text=result_text, business_connection_id=conn_id)
+            await try_delete_message(conn_id, message.message_id)
+        except Exception as e2:
+            logging.error(f"[SONG] Не удалось отправить результат в чат: {e2}")
+            await notify_owner(owner_id, result_text)
+            return
+
+    # Отрывок первого трека (30 сек от Deezer) тоже в чат
     if deezer and deezer[0].get("preview"):
         top = deezer[0]
         try:
             await bot.send_audio(
-                chat_id=owner_id, audio=top["preview"],
+                chat_id=chat_id, business_connection_id=conn_id, audio=top["preview"],
                 title=top["title"], performer=top["artist"]["name"],
             )
         except Exception as e:
