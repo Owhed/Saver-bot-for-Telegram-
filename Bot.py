@@ -3,6 +3,7 @@ import asyncio
 import aiosqlite
 import os
 import html
+import random
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile
 from aiogram.filters import CommandStart
@@ -85,6 +86,9 @@ async def cmd_start(message: types.Message):
         "Я бот для сохранения удалённых сообщений из <b>Telegram Business</b>.\n\n"
         "1️⃣ Подключите меня в <b>Настройки ➔ Telegram Business ➔ Чат-боты</b>.\n"
         "2️⃣ Все удалённые сообщения и медиафайлы из ваших бизнес-чатов будут приходить прямо сюда!\n\n"
+        "✨ <b>Команды в бизнес-чатах:</b>\n"
+        "<code>.tsundere текст</code> — сообщение в стиле цундере\n"
+        "<code>.kawaii текст</code> — пикми-режим\n\n"
         "Мой ТГК @rebfa\n"
         "поддержать: <code>UQDT1kkEirbQOmUlfvc9AX5LaKZUDteRw44uRQg_xOtpAOjc</code>"
     )
@@ -211,9 +215,113 @@ async def handle_business_connection(connection: types.BusinessConnection):
         logging.error(f"Ошибка в handle_business_connection: {e}")
 
 
+# ---------- Режимы стилизации: .tsundere и .kawaii ----------
+
+TSUNDERE_PREFIXES = [
+    "Х-хмф! Мне вообще-то это совсем не нужно, но",
+    "Д-дурак! Ладно, слушай:",
+    "Т-ты не подумай, что мне не всё равно, просто",
+    "Ц-цк... ну раз уж ты так просишь,",
+    "Н-не смотри на меня так! Короче,",
+]
+TSUNDERE_SUFFIXES = [
+    "— и это совсем не потому, что ты мне нравишься! 😤",
+    "Б-баka!",
+    "Хмф! Не задавай лишних вопросов!",
+    "И не думай, что это ради тебя! 💢",
+    "...и вообще, отстань! 😳",
+]
+
+KAWAII_PREFIXES = [
+    "Ой, ну я такое не умею, но",
+    "Ня~ слушай,",
+    "Ааа, только не смейся надо мной, но",
+    "Э-этоо... ну...",
+    "Уву~ а можно я скажу?",
+]
+KAWAII_SUFFIXES = [
+    "хихи~ 🥺👉👈",
+    "ты же не будешь ругаться? 💗",
+    "уву~ ✨",
+    "ня~ 🎀",
+    "я старалась~ 🥺💕",
+]
+
+
+def _soften_first_letter(text: str) -> str:
+    """Делает первую букву строчной, но не трогает аббревиатуры (ОК, ТГ и т.п.)."""
+    if len(text) > 1 and text[0].isupper() and not text[1].isupper():
+        return text[0].lower() + text[1:]
+    return text
+
+
+def tsundere_style(text: str) -> str:
+    body = _soften_first_letter(text.strip())
+    # Заикание на первом слове: "ты" -> "т-ты"
+    first, sep, rest = body.partition(" ")
+    if first and first[0].isalpha() and random.random() < 0.5:
+        body = f"{first[0]}-{first}{sep}{rest}"
+    return f"{random.choice(TSUNDERE_PREFIXES)} {body} {random.choice(TSUNDERE_SUFFIXES)}"
+
+
+def kawaii_style(text: str) -> str:
+    body = _soften_first_letter(text.strip())
+    # Заменяем завершающую точку на тильду
+    if body.endswith("."):
+        body = body[:-1] + "~"
+    elif body.endswith("!"):
+        body = body + "~"
+    return f"{random.choice(KAWAII_PREFIXES)} {body} {random.choice(KAWAII_SUFFIXES)}"
+
+
+STYLE_COMMANDS = {
+    ".tsundere": tsundere_style,
+    ".kawaii": kawaii_style,
+}
+
+
+async def handle_style_command(message: types.Message) -> bool:
+    """Если владелец написал '.tsundere текст' или '.kawaii текст' — редактируем сообщение."""
+    text = message.text
+    conn_id = message.business_connection_id
+    if not text or not conn_id:
+        return False
+
+    parts = text.split(None, 1)
+    command = parts[0].lower()
+    if command not in STYLE_COMMANDS:
+        return False
+
+    owner_id = await ensure_connection_owner(conn_id)
+    if not message.from_user or message.from_user.id != owner_id:
+        return False  # команды работают только у владельца аккаунта
+
+    if len(parts) < 2:
+        return True  # команда без текста — ничего не делаем
+
+    new_text = STYLE_COMMANDS[command](parts[1])[:4096]
+    try:
+        await bot.edit_message_text(
+            text=new_text,
+            business_connection_id=conn_id,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        logging.info(f"[СТИЛЬ] {command} применён к сообщению {message.message_id}")
+    except Exception as e:
+        logging.error(f"Не удалось изменить сообщение командой {command}: {e}")
+    return True
+
+
 # 2. Входящие бизнес-сообщения
 @dp.business_message()
 async def handle_business_message(message: types.Message):
+    try:
+        if await handle_style_command(message):
+            return
+    except Exception as e:
+        logging.error(f"Ошибка в handle_style_command: {e}")
+
     logging.info(
         f"[ВХОДЯЩЕЕ] id={message.message_id} type={message.content_type} "
         f"reply={'да' if message.reply_to_message else 'нет'}"
