@@ -64,6 +64,15 @@ async def init_db():
         )
     ''')
 
+    # Одноразовые медиа, которые уже были отправлены владельцу (защита от дублей)
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS one_time_sent (
+            message_id INTEGER,
+            chat_id INTEGER,
+            PRIMARY KEY (message_id, chat_id)
+        )
+    ''')
+
     await db_conn.commit()
     logging.info("База данных SQLite успешно запущена!")
 
@@ -207,6 +216,11 @@ async def handle_business_message(message: types.Message):
     except Exception as e:
         logging.error(f"Ошибка в handle_business_message: {e}")
 
+    try:
+        await forward_one_time_media(message)
+    except Exception as e:
+        logging.error(f"Ошибка в forward_one_time_media: {e}")
+
 
 # 2.1 Редактирование сообщений — обновляем кэш, чтобы при удалении был актуальный текст
 @dp.edited_business_message()
@@ -230,6 +244,68 @@ async def send_deleted_notice(target_id: int, text: str, file_id: str | None, me
         # Подпись не поддерживается или слишком длинная — шлём текст отдельно
         await bot.send_message(chat_id=target_id, text=text, parse_mode="HTML")
         await method(chat_id=target_id, **{arg: file_id})
+
+
+ONE_TIME_TYPES = {"photo", "video", "voice", "video_note"}
+
+
+async def forward_one_time_media(message: types.Message):
+    """
+    Если сообщение — ответ на медиа, которое бот не получил обычным путём
+    (одноразовое), берём медиа из reply_to_message и отправляем владельцу в ЛС.
+    """
+    reply = message.reply_to_message
+    conn_id = message.business_connection_id
+    if not reply or not conn_id:
+        return
+
+    content, file_id, media_type = extract_content(reply)
+    if not file_id or media_type not in ONE_TIME_TYPES:
+        return
+
+    chat_id = message.chat.id
+
+    # Если медиа мы уже видели обычным сообщением — оно не одноразовое
+    async with db_conn.execute(
+        "SELECT file_id FROM messages WHERE message_id = ? AND chat_id = ?",
+        (reply.message_id, chat_id)
+    ) as cursor:
+        cached = await cursor.fetchone()
+    if cached and cached[0]:
+        return
+
+    # Уже отправляли это медиа раньше
+    async with db_conn.execute(
+        "SELECT 1 FROM one_time_sent WHERE message_id = ? AND chat_id = ?",
+        (reply.message_id, chat_id)
+    ) as cursor:
+        if await cursor.fetchone():
+            return
+
+    owner_id = await ensure_connection_owner(conn_id)
+    if not owner_id:
+        return
+
+    sender = reply.from_user.full_name if reply.from_user else "Собеседник"
+    username = (
+        f"@{reply.from_user.username}"
+        if reply.from_user and reply.from_user.username
+        else "@нет_юзернейма"
+    )
+    notification = (
+        f"🔥 <b>Одноразовое сообщение!</b>\n\n"
+        f"👤 <b>Отправитель:</b> {html.escape(sender)} ({html.escape(username)})\n"
+        f"📝 <b>Описание:</b> {html.escape(content[:MAX_TEXT_LEN])}"
+    )
+
+    await send_deleted_notice(owner_id, notification, file_id, media_type)
+
+    await db_conn.execute(
+        "INSERT OR IGNORE INTO one_time_sent (message_id, chat_id) VALUES (?, ?)",
+        (reply.message_id, chat_id)
+    )
+    await db_conn.commit()
+    logging.info(f"[ОДНОРАЗОВОЕ] Медиа {reply.message_id} отправлено пользователю {owner_id}")
 
 
 # 3. Удаление сообщений
