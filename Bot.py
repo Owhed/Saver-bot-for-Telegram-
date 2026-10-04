@@ -84,7 +84,9 @@ async def cmd_start(message: types.Message):
         "👋 Привет!\n\n"
         "Я бот для сохранения удалённых сообщений из <b>Telegram Business</b>.\n\n"
         "1️⃣ Подключите меня в <b>Настройки ➔ Telegram Business ➔ Чат-боты</b>.\n"
-        "2️⃣ Все удалённые сообщения и медиафайлы из ваших бизнес-чатов будут приходить прямо сюда!"
+        "2️⃣ Все удалённые сообщения и медиафайлы из ваших бизнес-чатов будут приходить прямо сюда!\n\n"
+        "Мой ТГК @rebfa\n"
+        "поддержать: <code>UQDT1kkEirbQOmUlfvc9AX5LaKZUDteRw44uRQg_xOtpAOjc</code>"
     )
     await message.answer(welcome_text, parse_mode="HTML")
 
