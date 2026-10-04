@@ -90,6 +90,15 @@ async def init_db():
         )
     ''')
 
+    # Заглушённые чаты (.mute): для них не сохраняем сообщения и не шлём уведомления
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS muted_chats (
+            connection_id TEXT,
+            chat_id INTEGER,
+            PRIMARY KEY (connection_id, chat_id)
+        )
+    ''')
+
     # Включённые стили оформления для каждого владельца
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS formats (
@@ -345,6 +354,8 @@ HELP_TEXT = (
     ".duel — дуэль с собеседником, победителя решает случай\n"
     ".text — расшифровать голосовое или кружок (ответом на него)\n"
     ".video ссылка — скачать видео (TikTok, YouTube и др.) и отправить в чат\n"
+    ".mute — не давать собеседнику писать (его сообщения удаляются)\n"
+    ".unmute — снять запрет\n"
     ".song название или строчка — найти песню\n"
     ".bold — включить/выключить жирный шрифт\n"
     ".italic — включить/выключить курсив\n"
@@ -448,11 +459,13 @@ async def stop_ttt(message: types.Message):
     await try_delete_message(message.business_connection_id, message.message_id)
 
 
-async def try_delete_message(conn_id: str, message_id: int):
+async def try_delete_message(conn_id: str, message_id: int) -> bool:
     try:
         await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message_id])
+        return True
     except Exception as e:
-        logging.info(f"[ИГРА] Не удалось удалить сообщение {message_id}: {e}")
+        logging.info(f"[УДАЛЕНИЕ СООБЩЕНИЯ] Не удалось удалить {message_id}: {e}")
+        return False
 
 
 async def handle_ttt_move(message: types.Message) -> bool:
@@ -683,6 +696,82 @@ async def handle_song_command(message: types.Message, owner_id: int, args: str):
             )
         except Exception as e:
             logging.info(f"[SONG] Не удалось отправить отрывок: {e}")
+
+
+# ---------- Запрет собеседнику писать (.mute / .unmute) ----------
+
+MUTE_WARNED: set = set()  # чтобы не повторять предупреждение о правах
+
+
+async def is_muted(conn_id: str | None, chat_id: int) -> bool:
+    if not conn_id:
+        return False
+    async with db_conn.execute(
+        "SELECT 1 FROM muted_chats WHERE connection_id = ? AND chat_id = ?",
+        (conn_id, chat_id)
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def delete_if_muted(message: types.Message) -> bool:
+    """В заглушённом чате удаляем всё, что пишет собеседник. Сообщения владельца не трогаем."""
+    conn_id = message.business_connection_id
+    if not conn_id or not message.from_user:
+        return False
+    if not await is_muted(conn_id, message.chat.id):
+        return False
+
+    owner_id = await ensure_connection_owner(conn_id)
+    if message.from_user.id == owner_id:
+        return False
+
+    deleted = await try_delete_message(conn_id, message.message_id)
+    logging.info(f"[MUTE] Сообщение {message.message_id} из заглушённого чата {message.chat.id}: удалено={deleted}")
+
+    if not deleted and owner_id and (conn_id, message.chat.id) not in MUTE_WARNED:
+        MUTE_WARNED.add((conn_id, message.chat.id))
+        await notify_owner(
+            owner_id,
+            "⚠️ Не получилось удалить сообщение заглушённого собеседника. "
+            "Откройте Настройки → Telegram Business → Чат-боты и дайте боту право удалять все сообщения."
+        )
+    return True
+
+
+async def set_mute(message: types.Message, owner_id: int, muted: bool):
+    conn_id = message.business_connection_id
+    chat = message.chat
+    name = getattr(chat, "full_name", None) or chat.first_name or "собеседник"
+
+    if chat.id == owner_id:
+        await try_delete_message(conn_id, message.message_id)
+        await notify_owner(owner_id, "🔇 Эту команду нужно писать в чате с собеседником.")
+        return
+
+    already = await is_muted(conn_id, chat.id)
+
+    if muted:
+        await db_conn.execute(
+            "INSERT OR IGNORE INTO muted_chats (connection_id, chat_id) VALUES (?, ?)",
+            (conn_id, chat.id)
+        )
+        note = (
+            f"🔇 {name} уже заглушён." if already else
+            f"🔇 {name} заглушён: все его сообщения будут удаляться. Снять запрет: .unmute"
+        )
+    else:
+        await db_conn.execute(
+            "DELETE FROM muted_chats WHERE connection_id = ? AND chat_id = ?", (conn_id, chat.id)
+        )
+        MUTE_WARNED.discard((conn_id, chat.id))
+        note = (
+            f"🔊 {name} снова может писать." if already else
+            f"🔊 {name} и так не был заглушён."
+        )
+    await db_conn.commit()
+
+    await try_delete_message(conn_id, message.message_id)  # убираем команду из чата
+    await notify_owner(owner_id, note)
 
 
 # ---------- Скачивание видео по ссылке (.video) ----------
@@ -1138,7 +1227,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", ".mute", ".unmute", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -1181,6 +1270,10 @@ async def handle_help_and_games(message: types.Message) -> bool:
         await handle_video_command(message, owner_id, args)
         return True
 
+    if command in (".mute", ".unmute"):
+        await set_mute(message, owner_id, muted=(command == ".mute"))
+        return True
+
     if command in FORMAT_COMMANDS:
         if len(parts) == 1:  # переключатель — только когда сообщение состоит из одной команды
             await toggle_format(message, owner_id, FORMAT_COMMANDS[command])
@@ -1198,6 +1291,12 @@ async def handle_help_and_games(message: types.Message) -> bool:
 # 2. Входящие бизнес-сообщения
 @dp.business_message()
 async def handle_business_message(message: types.Message):
+    try:
+        if await delete_if_muted(message):
+            return
+    except Exception as e:
+        logging.error(f"Ошибка в delete_if_muted: {e}")
+
     try:
         if await handle_style_command(message):
             return
@@ -1234,6 +1333,8 @@ async def handle_business_message(message: types.Message):
 @dp.edited_business_message()
 async def handle_edited_business_message(message: types.Message):
     try:
+        if await delete_if_muted(message):
+            return
         await save_message(message)
     except Exception as e:
         logging.error(f"Ошибка в handle_edited_business_message: {e}")
