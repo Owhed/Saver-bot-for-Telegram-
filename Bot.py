@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 
 # ========================================================
-API_TOKEN = os.getenv('8848306379:AAGAgwUsiXXFIBC5Bfh08G8OTtufxEHAx0s')
+API_TOKEN = os.getenv('BOT_TOKEN')
 # ========================================================
 
 if not API_TOKEN:
