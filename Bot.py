@@ -76,6 +76,17 @@ async def init_db():
         )
     ''')
 
+    # Счёт дуэлей: побед владельца и собеседника в каждом чате
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS duels (
+            connection_id TEXT,
+            chat_id INTEGER,
+            owner_wins INTEGER DEFAULT 0,
+            opp_wins INTEGER DEFAULT 0,
+            PRIMARY KEY (connection_id, chat_id)
+        )
+    ''')
+
     # Включённые стили оформления для каждого владельца
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS formats (
@@ -328,6 +339,7 @@ HELP_TEXT = (
     ".ttt — крестики-нолики с собеседником (ходы цифрами 1–9)\n"
     ".ttt stop — остановить игру\n"
     ".neko — случайная картинка с кошкодевочкой\n"
+    ".duel — дуэль с собеседником, победителя решает случай\n"
     ".bold — включить/выключить жирный шрифт\n"
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
@@ -468,6 +480,89 @@ async def handle_ttt_move(message: types.Message) -> bool:
     if result:
         GAMES.pop(game_key(message), None)
     return True
+
+
+# ---------- Дуэль (.duel) ----------
+
+DUEL_RUNNING: set = set()
+
+
+def hp_bar(hp: int) -> str:
+    filled = round(max(hp, 0) / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+async def run_duel(message: types.Message):
+    key = game_key(message)
+    if key in DUEL_RUNNING:
+        return  # в этом чате дуэль уже идёт
+    DUEL_RUNNING.add(key)
+
+    try:
+        conn_id = message.business_connection_id
+        chat = message.chat
+        names = [
+            message.from_user.full_name,
+            getattr(chat, "full_name", None) or chat.first_name or "Соперник",
+        ]
+        hp = [100, 100]
+        ctx = {"conn_id": conn_id, "msg_id": message.message_id}  # команда превращается в поле боя
+
+        def frame(extra: str) -> str:
+            return (
+                f"⚔️ Дуэль!\n{names[0]} vs {names[1]}\n\n"
+                f"{names[0]}\n{hp_bar(hp[0])} {hp[0]} HP\n"
+                f"{names[1]}\n{hp_bar(hp[1])} {hp[1]} HP\n\n{extra}"
+            )
+
+        await update_board(ctx, chat.id, frame("Бойцы выходят на арену... 🔫"))
+
+        attacker = random.randint(0, 1)
+        while min(hp) > 0:
+            await asyncio.sleep(1.5)
+            defender = 1 - attacker
+            roll = random.random()
+            if roll < 0.10:
+                dmg = 0
+                event = f"💨 {names[attacker]} промахнулся!"
+            else:
+                dmg = random.randint(8, 35)
+                if roll > 0.85:
+                    dmg = int(dmg * 1.5)
+                    event = f"💥 КРИТ! {names[attacker]} наносит {dmg} урона"
+                else:
+                    event = f"🗡 {names[attacker]} наносит {dmg} урона"
+            hp[defender] = max(0, hp[defender] - dmg)
+            await update_board(ctx, chat.id, frame(event))
+            attacker = defender
+
+        winner = 0 if hp[0] > 0 else 1
+
+        # Обновляем общий счёт между владельцем и собеседником
+        column = "owner_wins" if winner == 0 else "opp_wins"
+        await db_conn.execute(
+            "INSERT OR IGNORE INTO duels (connection_id, chat_id) VALUES (?, ?)",
+            (conn_id, chat.id)
+        )
+        await db_conn.execute(
+            f"UPDATE duels SET {column} = {column} + 1 WHERE connection_id = ? AND chat_id = ?",
+            (conn_id, chat.id)
+        )
+        await db_conn.commit()
+        async with db_conn.execute(
+            "SELECT owner_wins, opp_wins FROM duels WHERE connection_id = ? AND chat_id = ?",
+            (conn_id, chat.id)
+        ) as cursor:
+            row = await cursor.fetchone()
+        ow, pw = row if row else (0, 0)
+
+        await update_board(
+            ctx, chat.id,
+            frame(f"🏆 Победитель: {names[winner]}!\n\n📊 Общий счёт: {names[0]} {ow} : {pw} {names[1]}")
+        )
+        logging.info(f"[ДУЭЛЬ] Чат {chat.id}: победил {names[winner]}")
+    finally:
+        DUEL_RUNNING.discard(key)
 
 
 # ---------- Авто-форматирование: .bold .italic .monospace .underline ----------
@@ -648,7 +743,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -670,6 +765,11 @@ async def handle_help_and_games(message: types.Message) -> bool:
 
     if command == ".neko":
         await send_neko(message)
+        return True
+
+    if command == ".duel":
+        if message.chat.id != owner_id:
+            await run_duel(message)
         return True
 
     if command in FORMAT_COMMANDS:
