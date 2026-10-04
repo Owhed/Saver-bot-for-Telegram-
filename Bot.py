@@ -4,8 +4,10 @@ import aiosqlite
 import os
 import html
 import random
+import re
+import tempfile
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, FSInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
@@ -341,6 +343,7 @@ HELP_TEXT = (
     ".neko — случайная картинка с кошкодевочкой\n"
     ".duel — дуэль с собеседником, победителя решает случай\n"
     ".text — расшифровать голосовое или кружок (ответом на него)\n"
+    ".video ссылка — скачать видео (TikTok, YouTube и др.) и отправить в чат\n"
     ".song название или строчка — найти песню\n"
     ".bold — включить/выключить жирный шрифт\n"
     ".italic — включить/выключить курсив\n"
@@ -681,6 +684,122 @@ async def handle_song_command(message: types.Message, owner_id: int, args: str):
             logging.info(f"[SONG] Не удалось отправить отрывок: {e}")
 
 
+# ---------- Скачивание видео по ссылке (.video) ----------
+
+VIDEO_MAX_BYTES = 49 * 1024 * 1024   # лимит Telegram на загрузку файлов ботами — 50 МБ
+VIDEO_MAX_DURATION = 15 * 60         # не качаем ролики длиннее 15 минут
+_video_semaphore = None
+
+
+def get_video_semaphore() -> asyncio.Semaphore:
+    """Качаем по одному видео за раз, чтобы не перегружать бесплатный сервер."""
+    global _video_semaphore
+    if _video_semaphore is None:
+        _video_semaphore = asyncio.Semaphore(1)
+    return _video_semaphore
+
+
+def _download_video_sync(url: str, tmpdir: str) -> dict:
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("не установлен yt-dlp: добавьте строку yt-dlp в requirements.txt")
+
+    opts = {
+        # Только готовые файлы без склейки (на сервере нет ffmpeg), в пределах лимита Telegram
+        "format": "b[ext=mp4][filesize<48M]/b[ext=mp4][filesize_approx<48M]/b[filesize<48M]/b[ext=mp4]/b",
+        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "no_color": True,
+        "restrictfilenames": True,
+        "socket_timeout": 20,
+        "max_filesize": VIDEO_MAX_BYTES,
+    }
+
+    cookies = os.getenv("YTDLP_COOKIES")  # необязательно: cookies в формате Netscape (для YouTube/Instagram)
+    if cookies:
+        cookie_path = os.path.join(tmpdir, "cookies.txt")
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write(cookies)
+        opts["cookiefile"] = cookie_path
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if (info.get("duration") or 0) > VIDEO_MAX_DURATION:
+            raise RuntimeError("видео длиннее 15 минут")
+        info = ydl.process_ie_result(info, download=True)
+        requested = info.get("requested_downloads") or [{}]
+        filepath = requested[0].get("filepath") or ydl.prepare_filename(info)
+
+    if not filepath or not os.path.exists(filepath):
+        raise RuntimeError("видео слишком большое (лимит Telegram для ботов — 50 МБ) или недоступно")
+    if os.path.getsize(filepath) > VIDEO_MAX_BYTES:
+        raise RuntimeError("видео больше 50 МБ — Telegram не позволяет ботам отправлять такие файлы")
+
+    return {
+        "path": filepath,
+        "title": info.get("title") or "",
+        "duration": int(info.get("duration") or 0),
+        "width": info.get("width"),
+        "height": info.get("height"),
+    }
+
+
+async def handle_video_command(message: types.Message, owner_id: int, args: str):
+    conn_id = message.business_connection_id
+    chat_id = message.chat.id
+
+    source = args
+    reply = message.reply_to_message
+    if not re.search(r"https?://\S+", source) and reply:
+        source = reply.text or reply.caption or ""
+
+    match = re.search(r"https?://\S+", source)
+    if not match:
+        await try_delete_message(conn_id, message.message_id)
+        await notify_owner(owner_id, "🎬 Укажите ссылку: .video https://... (или ответьте командой на сообщение со ссылкой)")
+        return
+    url = match.group(0).rstrip(").,]>")
+
+    # Команда превращается в статус, пока видео скачивается
+    try:
+        await bot.edit_message_text(
+            text="⏳ Скачиваю видео…", business_connection_id=conn_id,
+            chat_id=chat_id, message_id=message.message_id,
+        )
+    except Exception as e:
+        logging.info(f"[VIDEO] Не удалось показать статус: {e}")
+
+    try:
+        async with get_video_semaphore():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = await asyncio.to_thread(_download_video_sync, url, tmpdir)
+
+                video = FSInputFile(result["path"])
+                caption = result["title"][:200] or None
+                try:
+                    await bot.send_video(
+                        chat_id=chat_id, business_connection_id=conn_id, video=video,
+                        caption=caption, duration=result["duration"] or None,
+                        width=result["width"], height=result["height"],
+                        supports_streaming=True,
+                    )
+                except Exception as e:
+                    logging.info(f"[VIDEO] Не вышло как видео ({e}), отправляю файлом")
+                    await bot.send_document(
+                        chat_id=chat_id, business_connection_id=conn_id,
+                        document=FSInputFile(result["path"]), caption=caption,
+                    )
+        logging.info(f"[VIDEO] Отправлено видео из {url}")
+    except Exception as e:
+        logging.error(f"[VIDEO] Ошибка: {e}")
+        await notify_owner(owner_id, f"❌ Не удалось скачать видео:\n{str(e)[:600]}\n\n{url}")
+
+    await try_delete_message(conn_id, message.message_id)  # убираем статус/команду
+
+
 # ---------- Дуэль (.duel) ----------
 
 DUEL_RUNNING: set = set()
@@ -942,7 +1061,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -978,6 +1097,11 @@ async def handle_help_and_games(message: types.Message) -> bool:
     if command == ".song":
         args = text.split(None, 1)[1] if len(parts) > 1 else ""
         await handle_song_command(message, owner_id, args)
+        return True
+
+    if command == ".video":
+        args = text.split(None, 1)[1] if len(parts) > 1 else ""
+        await handle_video_command(message, owner_id, args)
         return True
 
     if command in FORMAT_COMMANDS:
