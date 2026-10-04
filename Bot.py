@@ -3,6 +3,7 @@ import asyncio
 import aiosqlite
 import os
 import html
+import json
 import random
 import re
 import tempfile
@@ -718,6 +719,11 @@ def _download_video_sync(url: str, tmpdir: str) -> dict:
         "max_filesize": VIDEO_MAX_BYTES,
     }
 
+    proxy = os.getenv("VIDEO_PROXY")  # необязательно: http://user:pass@host:port
+    if proxy:
+        opts["proxy"] = proxy
+    logging.info(f"[VIDEO] yt-dlp версия {yt_dlp.version.__version__}")
+
     cookies = os.getenv("YTDLP_COOKIES")  # необязательно: cookies в формате Netscape (для YouTube/Instagram)
     if cookies:
         cookie_path = os.path.join(tmpdir, "cookies.txt")
@@ -754,12 +760,34 @@ def is_tiktok_url(url: str) -> bool:
 async def download_tiktok_fallback(url: str, tmpdir: str) -> dict:
     """Запасной способ для TikTok через сторонний сервис tikwm (если yt-dlp заблокирован)."""
     timeout = aiohttp.ClientTimeout(total=60)
-    headers = {"User-Agent": "Mozilla/5.0"}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get("https://www.tikwm.com/api/", params={"url": url}) as resp:
-            data = await resp.json(content_type=None)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    }
+    proxy = os.getenv("VIDEO_PROXY") or None
 
-        info = data.get("data") or {}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        data = None
+        status = None
+        body = ""
+        for _ in range(2):  # сервис ограничивает частоту запросов — одна повторная попытка
+            async with session.post(
+                "https://www.tikwm.com/api/", data={"url": url, "hd": 1}, proxy=proxy
+            ) as resp:
+                status = resp.status
+                body = await resp.text()
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and data.get("code") == 0:
+                break
+            await asyncio.sleep(1.5)
+
+        if not isinstance(data, dict):
+            raise RuntimeError(f"tikwm не вернул данные (HTTP {status}, ответ: {body[:100]!r})")
+
+        info = data.get("data") if isinstance(data.get("data"), dict) else {}
         video_url = info.get("play") or info.get("hdplay")
         if data.get("code") != 0 or not video_url:
             raise RuntimeError(data.get("msg") or "в ответе нет видео (возможно, это пост с фото)")
@@ -768,7 +796,7 @@ async def download_tiktok_fallback(url: str, tmpdir: str) -> dict:
 
         path = os.path.join(tmpdir, "tiktok.mp4")
         size = 0
-        async with session.get(video_url) as resp:
+        async with session.get(video_url, proxy=proxy) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"не удалось скачать файл ({resp.status})")
             with open(path, "wb") as f:
