@@ -90,6 +90,14 @@ async def init_db():
         )
     ''')
 
+    # Служебные значения (например, последняя объявленная версия бота)
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+
     # Заглушённые чаты (.mute): для них не сохраняем сообщения и не шлём уведомления
     await db_conn.execute('''
         CREATE TABLE IF NOT EXISTS muted_chats (
@@ -702,6 +710,10 @@ async def handle_song_command(message: types.Message, owner_id: int, args: str):
 
 MUTE_WARNED: set = set()  # чтобы не повторять предупреждение о правах
 
+# Тексты, которые видит собеседник в чате (можно поменять)
+MUTE_NOTICE = "🔇 Вам ограничили возможность писать в этом чате. Ваши сообщения будут удаляться."
+UNMUTE_NOTICE = "🔊 Ограничение снято — теперь вы снова можете писать."
+
 
 async def is_muted(conn_id: str | None, chat_id: int) -> bool:
     if not conn_id:
@@ -770,7 +782,15 @@ async def set_mute(message: types.Message, owner_id: int, muted: bool):
         )
     await db_conn.commit()
 
-    await try_delete_message(conn_id, message.message_id)  # убираем команду из чата
+    # Предупреждаем собеседника прямо в чате: команда превращается в уведомление
+    changed = (muted and not already) or (not muted and already)
+    if changed:
+        ctx = {"conn_id": conn_id, "msg_id": message.message_id}
+        await update_board(ctx, chat.id, MUTE_NOTICE if muted else UNMUTE_NOTICE)
+        if ctx["msg_id"] != message.message_id:
+            await try_delete_message(conn_id, message.message_id)  # правка не вышла — убираем команду
+    else:
+        await try_delete_message(conn_id, message.message_id)
     await notify_owner(owner_id, note)
 
 
@@ -1493,6 +1513,38 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
 
 NOTIFY_STATUS = True  # писать пользователям бота о запуске и остановке
 
+# ---------- Список изменений ----------
+# При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
+# После запуска бот сам пришлёт её всем пользователям.
+CHANGELOG = [
+    ("1.1.0", [
+        "🔇 .mute теперь предупреждает собеседника в чате, а .unmute сообщает, что ограничение снято",
+        "📣 После каждого обновления бот присылает список изменений",
+    ]),
+    ("1.0.0", [
+        "💾 Сохранение удалённых сообщений и медиа из бизнес-чатов",
+        "🔥 Пересылка одноразовых фото, видео и голосовых при ответе на них",
+        "📋 Список всех команд: .help",
+    ]),
+]
+CURRENT_VERSION = CHANGELOG[0][0]
+
+
+def format_changelog() -> str:
+    version, notes = CHANGELOG[0]
+    return f"🆕 Бот обновлён до версии {version}\n\nЧто нового:\n" + "\n".join(f"• {n}" for n in notes)
+
+
+async def get_meta(key: str) -> str | None:
+    async with db_conn.execute("SELECT value FROM meta WHERE key = ?", (key,)) as cursor:
+        row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def set_meta(key: str, value: str):
+    await db_conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    await db_conn.commit()
+
 
 async def notify_all_owners(text: str):
     """Отправляет сообщение всем, кто подключил бота (в личку с ботом, а не в чаты с собеседниками)."""
@@ -1533,7 +1585,12 @@ async def main():
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await notify_all_owners("✅ Бот снова в сети. Техработы завершены.")
+        if await get_meta("announced_version") != CURRENT_VERSION:
+            # Первый запуск после обновления — присылаем список изменений
+            await notify_all_owners(format_changelog())
+            await set_meta("announced_version", CURRENT_VERSION)
+        else:
+            await notify_all_owners("✅ Бот снова в сети. Техработы завершены.")
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
