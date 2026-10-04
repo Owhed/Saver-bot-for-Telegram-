@@ -4,6 +4,7 @@ import aiosqlite
 import os
 import html
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import BufferedInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
@@ -250,6 +251,26 @@ async def send_deleted_notice(target_id: int, text: str, file_id: str | None, me
         await method(chat_id=target_id, **{arg: file_id})
 
 
+ONE_TIME_EXT = {"photo": "jpg", "video": "mp4", "voice": "ogg", "video_note": "mp4"}
+
+
+async def send_one_time_notice(target_id: int, text: str, file_id: str, media_type: str):
+    """
+    Telegram не даёт переотправить file_id одноразового медиа (SelfDestructingPhoto и т.п.),
+    поэтому скачиваем файл и загружаем его заново как обычный.
+    """
+    tg_file = await bot.get_file(file_id)
+    data = await bot.download_file(tg_file.file_path)
+    upload = BufferedInputFile(data.read(), filename=f"one_time.{ONE_TIME_EXT[media_type]}")
+
+    method, arg = MEDIA_SENDERS[media_type]
+    if media_type in CAPTION_TYPES and len(text) <= CAPTION_LIMIT:
+        await method(chat_id=target_id, **{arg: upload}, caption=text, parse_mode="HTML")
+    else:
+        await bot.send_message(chat_id=target_id, text=text, parse_mode="HTML")
+        await method(chat_id=target_id, **{arg: upload})
+
+
 ONE_TIME_TYPES = {"photo", "video", "voice", "video_note"}
 ONLY_OWNER_REPLIES = True  # True: только когда отвечаете вы; False: на любой ответ в чате
 
@@ -304,7 +325,7 @@ async def forward_one_time_media(message: types.Message):
         f"📝 <b>Описание:</b> {html.escape(content[:MAX_TEXT_LEN])}"
     )
 
-    await send_deleted_notice(owner_id, notification, file_id, media_type)
+    await send_one_time_notice(owner_id, notification, file_id, media_type)
 
     await db_conn.execute(
         "INSERT OR IGNORE INTO one_time_sent (message_id, chat_id) VALUES (?, ?)",
