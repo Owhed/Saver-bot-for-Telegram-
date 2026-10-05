@@ -2322,6 +2322,29 @@ async def stars_recover():
         logging.info(f"[STARS] Возвращены ставки в {len(rows)} прерванных играх")
 
 
+# --- админка ---
+
+ADMIN_ID = 8478742975  # ваш Telegram ID
+
+
+@stars_router.message(
+    F.chat.type == "private",
+    F.from_user.id == ADMIN_ID,
+    F.text.regexp(r"^\.give(\s+\d+)?\s+-?\d+$"),
+)
+async def cmd_give(message: types.Message):
+    """.give сумма — себе; .give ID сумма — другому пользователю (отрицательная сумма списывает)."""
+    nums = [int(x) for x in message.text.split()[1:]]
+    target, amount = (ADMIN_ID, nums[0]) if len(nums) == 1 else (nums[0], nums[1])
+
+    if amount >= 0:
+        await add_balance(target, amount)
+    elif not await try_deduct(target, -amount):
+        return await message.answer("❌ У пользователя недостаточно средств для списания.")
+
+    await message.answer(f"✅ Баланс {target}: {await get_balance(target)} ⭐️")
+
+
 dp.include_router(stars_router)
 
 
