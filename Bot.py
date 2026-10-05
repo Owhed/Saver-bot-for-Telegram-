@@ -7,10 +7,11 @@ import json
 import random
 import re
 import tempfile
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import BufferedInputFile, FSInputFile
+import time
+from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.types import BufferedInputFile, FSInputFile, LabeledPrice, PreCheckoutQuery
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
 from aiohttp import web
@@ -124,12 +125,38 @@ async def init_db():
         )
     ''')
 
+    # Игровой баланс (звёзды) для дуэлей .dicep
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0
+        )
+    ''')
+
+    # Дуэли на звёзды: хранятся в БД, чтобы ставки не терялись при перезапуске
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS stars_games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player1 INTEGER,
+            player1_name TEXT,
+            player2 INTEGER,
+            player2_name TEXT,
+            bet INTEGER,
+            status TEXT,
+            created INTEGER
+        )
+    ''')
+
     await db_conn.commit()
     logging.info("База данных SQLite успешно запущена!")
 
 
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, command: CommandObject):
+    # Ссылка-приглашение в дуэль на звёзды: /start join_N
+    if command.args and command.args.startswith("join_"):
+        return await stars_join_from_start(message, command.args)
+
     welcome_text = (
         "👋 Привет!\n\n"
         "Я бот для сохранения удалённых сообщений из <b>Telegram</b>.\n\n"
@@ -545,7 +572,12 @@ HELP_TEXT = (
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
     ".underline — включить/выключить подчёркивание\n"
-    ".help — этот список"
+    ".help — этот список\n\n"
+    "⭐️ Команды в личке с ботом (дуэль на звёзды):\n\n"
+    ".dicep ставка — создать дуэль на кубиках (по умолчанию 50 ⭐️)\n"
+    ".bal — игровой баланс\n"
+    ".cancel — отменить свои игры без соперника\n"
+    ".withdraw — вывод (пока недоступен)"
 )
 
 # Активные игры: chat_id -> состояние (хранятся в памяти, при перезапуске бота сбрасываются)
@@ -1949,12 +1981,359 @@ async def handle_deleted_business_messages(event: types.BusinessMessagesDeleted)
         logging.error(f"Ошибка при обработке удаления: {e}")
 
 
+# ---------- Дуэль на звёзды (.dicep, .bal, .cancel, .withdraw) ----------
+
+STARS_MIN_BET = 1
+STARS_MAX_BET = 10000
+STARS_COMMISSION = 0.10
+STARS_P2_TIMEOUT = 300  # сек: сколько соперник может не оплачивать счёт
+
+stars_router = Router()
+_BG_TASKS: set = set()  # чтобы фоновые задачи не собрал сборщик мусора
+
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+# --- баланс (через общее соединение db_conn, списание атомарное) ---
+
+async def get_balance(user_id: int) -> int:
+    async with db_conn.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+async def add_balance(user_id: int, amount: int):
+    await db_conn.execute(
+        "INSERT INTO users (user_id, balance) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance",
+        (user_id, amount),
+    )
+    await db_conn.commit()
+
+
+async def try_deduct(user_id: int, amount: int) -> bool:
+    """Списывает только если хватает денег. Баланс не может уйти в минус."""
+    cur = await db_conn.execute(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+        (amount, user_id, amount),
+    )
+    await db_conn.commit()
+    return cur.rowcount > 0
+
+
+# --- игры хранятся в БД (а не в памяти), чтобы ставки не терялись при перезапуске ---
+
+GAME_COLS = "id, player1, player1_name, player2, player2_name, bet, status"
+
+
+async def get_game(game_id: int) -> dict | None:
+    async with db_conn.execute(f"SELECT {GAME_COLS} FROM stars_games WHERE id = ?", (game_id,)) as cur:
+        row = await cur.fetchone()
+    return dict(zip(GAME_COLS.split(", "), row)) if row else None
+
+
+async def create_game(user_id: int, name: str, bet: int, status: str) -> int:
+    cur = await db_conn.execute(
+        "INSERT INTO stars_games (player1, player1_name, bet, status, created) VALUES (?, ?, ?, ?, ?)",
+        (user_id, name, bet, status, int(time.time())),
+    )
+    await db_conn.commit()
+    return cur.lastrowid
+
+
+async def invite_link(game_id: int) -> str:
+    me = await bot.me()
+    return f"https://t.me/{me.username}?start=join_{game_id}"
+
+
+async def send_invite(chat_id: int, game_id: int):
+    link = await invite_link(game_id)
+    await bot.send_message(
+        chat_id,
+        f"🎲 Игра #{game_id} активирована!\n\n🔗 <b>Ссылка для соперника:</b>\n<code>{link}</code>",
+        parse_mode="HTML",
+    )
+
+
+# --- команды ---
+
+@stars_router.message(F.chat.type == "private", F.text == ".bal")
+async def cmd_bal(message: types.Message):
+    balance = await get_balance(message.from_user.id)
+    await message.answer(f"💳 <b>Ваш игровой баланс:</b> {balance} ⭐️", parse_mode="HTML")
+
+
+@stars_router.message(F.chat.type == "private", F.text == ".withdraw")
+async def cmd_withdraw(message: types.Message):
+    await message.answer("⚠️ Вывод пока недоступен. Баланс можно использовать только для ставок.")
+
+
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.dicep(\s|$)"))
+async def cmd_dicep(message: types.Message):
+    user = message.from_user
+    parts = message.text.split()
+    bet = 50
+    if len(parts) > 1:
+        if not parts[1].isdigit():
+            return await message.answer("❌ Ставка должна быть числом: .dicep 50")
+        bet = int(parts[1])
+    if not STARS_MIN_BET <= bet <= STARS_MAX_BET:
+        return await message.answer(f"❌ Ставка от {STARS_MIN_BET} до {STARS_MAX_BET} ⭐️")
+
+    if await try_deduct(user.id, bet):
+        game_id = await create_game(user.id, user.full_name, bet, "ready_for_p2")
+        await send_invite(message.chat.id, game_id)
+    else:
+        game_id = await create_game(user.id, user.full_name, bet, "waiting_p1_payment")
+        await bot.send_invoice(
+            chat_id=message.chat.id,
+            title=f"Создание игры #{game_id}",
+            description=f"Оплатите ставку {bet} ⭐️",
+            payload=f"p1_pay_{game_id}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Ставка в игре #{game_id}", amount=bet)],
+        )
+
+
+@stars_router.message(F.chat.type == "private", F.text == ".cancel")
+async def cmd_cancel(message: types.Message):
+    """Отмена своих игр, в которых ещё нет соперника; ставка возвращается на баланс."""
+    user_id = message.from_user.id
+    async with db_conn.execute(
+        "SELECT id, bet, status FROM stars_games "
+        "WHERE player1 = ? AND status IN ('ready_for_p2', 'waiting_p1_payment')", (user_id,)
+    ) as cur:
+        games = await cur.fetchall()
+
+    if not games:
+        return await message.answer("У вас нет игр, которые можно отменить.")
+
+    for game_id, bet, status in games:
+        cur = await db_conn.execute("DELETE FROM stars_games WHERE id = ? AND status = ?", (game_id, status))
+        await db_conn.commit()
+        if cur.rowcount and status == "ready_for_p2":
+            await add_balance(user_id, bet)
+    await message.answer("✅ Игры отменены, ставки возвращены на баланс.")
+
+
+# --- присоединение соперника (вызывается из /start join_N) ---
+
+async def stars_join_from_start(message: types.Message, args: str):
+    user = message.from_user
+    try:
+        game_id = int(args.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return await message.answer("❌ Неверная ссылка.")
+
+    game = await get_game(game_id)
+    if not game:
+        return await message.answer("❌ Игра не найдена.")
+    if game["player1"] == user.id:
+        return await message.answer("❌ Нельзя играть против себя!")
+
+    # Атомарно занимаем место соперника: два человека не смогут зайти одновременно
+    cur = await db_conn.execute(
+        "UPDATE stars_games SET player2 = ?, player2_name = ?, status = 'waiting_p2_payment' "
+        "WHERE id = ? AND status = 'ready_for_p2' AND player1 != ?",
+        (user.id, user.full_name, game_id, user.id),
+    )
+    await db_conn.commit()
+    if cur.rowcount == 0:
+        return await message.answer("❌ В игре уже есть соперник или она недоступна.")
+
+    if await try_deduct(user.id, game["bet"]):
+        await db_conn.execute("UPDATE stars_games SET status = 'rolling' WHERE id = ?", (game_id,))
+        await db_conn.commit()
+        await start_rolling(game_id)
+    else:
+        await bot.send_invoice(
+            chat_id=message.chat.id,
+            title=f"Принять вызов #{game_id}",
+            description=f"Оплатите {game['bet']} ⭐️",
+            payload=f"p2_pay_{game_id}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Вход в игру #{game_id}", amount=game["bet"])],
+        )
+        spawn(p2_payment_timeout(game_id, user.id))
+
+
+async def p2_payment_timeout(game_id: int, p2_id: int):
+    """Если соперник не оплатил — освобождаем место, игра снова открыта."""
+    await asyncio.sleep(STARS_P2_TIMEOUT)
+    await db_conn.execute(
+        "UPDATE stars_games SET player2 = NULL, player2_name = NULL, status = 'ready_for_p2' "
+        "WHERE id = ? AND status = 'waiting_p2_payment' AND player2 = ?",
+        (game_id, p2_id),
+    )
+    await db_conn.commit()
+
+
+async def start_rolling(game_id: int):
+    game = await get_game(game_id)
+    if not game:
+        return
+    try:
+        await bot.send_message(game["player1"], f"🔥 {game['player2_name']} принял вызов!")
+    except Exception as e:
+        logging.info(f"[STARS] Не удалось написать игроку 1: {e}")
+    try:
+        await bot.send_message(game["player2"], "🚀 Игра начинается...")
+    except Exception as e:
+        logging.info(f"[STARS] Не удалось написать игроку 2: {e}")
+    spawn(run_game_logic(game_id))
+
+
+# --- оплата звёздами ---
+
+@stars_router.pre_checkout_query()
+async def stars_pre_checkout(query: PreCheckoutQuery):
+    kind, _, gid = query.invoice_payload.rpartition("_")
+    game = await get_game(int(gid)) if gid.isdigit() else None
+    ok = False
+    if game:
+        if kind == "p1_pay":
+            ok = game["status"] == "waiting_p1_payment" and game["player1"] == query.from_user.id
+        elif kind == "p2_pay":
+            ok = game["status"] == "waiting_p2_payment" and game["player2"] == query.from_user.id
+    await query.answer(ok=ok, error_message=None if ok else "Игра больше недоступна, создайте новую.")
+
+
+@stars_router.message(F.successful_payment)
+async def stars_payment(message: types.Message):
+    pay = message.successful_payment
+    user_id = message.from_user.id
+    kind, _, gid = pay.invoice_payload.rpartition("_")
+    game_id = int(gid) if gid.isdigit() else None
+    handled = False
+
+    if game_id is not None and kind == "p1_pay":
+        cur = await db_conn.execute(
+            "UPDATE stars_games SET status = 'ready_for_p2' "
+            "WHERE id = ? AND player1 = ? AND status = 'waiting_p1_payment'", (game_id, user_id)
+        )
+        await db_conn.commit()
+        if cur.rowcount:
+            handled = True
+            await send_invite(message.chat.id, game_id)
+    elif game_id is not None and kind == "p2_pay":
+        cur = await db_conn.execute(
+            "UPDATE stars_games SET status = 'rolling' "
+            "WHERE id = ? AND player2 = ? AND status = 'waiting_p2_payment'", (game_id, user_id)
+        )
+        await db_conn.commit()
+        if cur.rowcount:
+            handled = True
+            await start_rolling(game_id)
+
+    if not handled:
+        # Игра успела стать недоступной — деньги не пропадают, а попадают на баланс
+        await add_balance(user_id, pay.total_amount)
+        await message.answer(f"⚠️ Игра уже недоступна. {pay.total_amount} ⭐️ зачислены на игровой баланс.")
+
+
+# --- сама игра ---
+
+async def roll_pair(roller: int, watcher: int) -> int:
+    await bot.send_message(roller, "🎲 Ваш ход...")
+    total = 0
+    for _ in range(2):
+        d = await bot.send_dice(chat_id=roller, emoji="🎲")
+        try:
+            await bot.forward_message(chat_id=watcher, from_chat_id=roller, message_id=d.message_id)
+        except Exception as e:
+            logging.info(f"[STARS] Не удалось показать кубик сопернику: {e}")
+        total += d.dice.value
+        await asyncio.sleep(4)
+    return total
+
+
+async def safe_send(chat_id: int, text: str):
+    try:
+        await bot.send_message(chat_id, text)
+    except Exception as e:
+        logging.info(f"[STARS] Не удалось написать {chat_id}: {e}")
+
+
+async def run_game_logic(game_id: int):
+    game = await get_game(game_id)
+    if not game or game["status"] != "rolling":
+        return
+    p1, p2, bet = game["player1"], game["player2"], game["bet"]
+
+    try:
+        s1 = await roll_pair(p1, p2)
+        s2 = await roll_pair(p2, p1)
+    except Exception as e:
+        # Сбой до результата — возвращаем обе ставки
+        logging.error(f"[STARS] Игра {game_id} прервана: {e}")
+        cur = await db_conn.execute("DELETE FROM stars_games WHERE id = ? AND status = 'rolling'", (game_id,))
+        await db_conn.commit()
+        if cur.rowcount:
+            await add_balance(p1, bet)
+            await add_balance(p2, bet)
+            await safe_send(p1, "⚠️ Игра прервана из-за ошибки. Ставка возвращена на баланс.")
+            await safe_send(p2, "⚠️ Игра прервана из-за ошибки. Ставка возвращена на баланс.")
+        return
+
+    # Сначала закрываем игру: повторно выплатить её уже не получится
+    cur = await db_conn.execute("DELETE FROM stars_games WHERE id = ? AND status = 'rolling'", (game_id,))
+    await db_conn.commit()
+    if not cur.rowcount:
+        return
+
+    total_bank = bet * 2
+    prize = total_bank - int(total_bank * STARS_COMMISSION)
+
+    if s1 > s2:
+        await add_balance(p1, prize)
+        await safe_send(p1, f"🏆 Вы выиграли {prize} ⭐️ ({s1} vs {s2})")
+        await safe_send(p2, f"📉 Вы проиграли ({s2} vs {s1})")
+    elif s2 > s1:
+        await add_balance(p2, prize)
+        await safe_send(p2, f"🏆 Вы выиграли {prize} ⭐️ ({s2} vs {s1})")
+        await safe_send(p1, f"📉 Вы проиграли ({s1} vs {s2})")
+    else:
+        await add_balance(p1, bet)
+        await add_balance(p2, bet)
+        await safe_send(p1, f"🤝 Ничья ({s1}={s2}). Ставка возвращена.")
+        await safe_send(p2, f"🤝 Ничья ({s2}={s1}). Ставка возвращена.")
+
+
+async def stars_recover():
+    """Вызывать при старте: ставки зависших игр возвращаются, ничего не теряется."""
+    async with db_conn.execute("SELECT id, player1, player2, bet FROM stars_games WHERE status = 'rolling'") as cur:
+        rows = await cur.fetchall()
+    for game_id, p1, p2, bet in rows:
+        await add_balance(p1, bet)
+        if p2:
+            await add_balance(p2, bet)
+        await db_conn.execute("DELETE FROM stars_games WHERE id = ?", (game_id,))
+    await db_conn.execute("DELETE FROM stars_games WHERE status = 'waiting_p1_payment'")
+    await db_conn.execute(
+        "UPDATE stars_games SET player2 = NULL, player2_name = NULL, status = 'ready_for_p2' "
+        "WHERE status = 'waiting_p2_payment'"
+    )
+    await db_conn.commit()
+    if rows:
+        logging.info(f"[STARS] Возвращены ставки в {len(rows)} прерванных играх")
+
+
+dp.include_router(stars_router)
+
+
 NOTIFY_STATUS = True  # писать пользователям бота о запуске и остановке
 
 # ---------- Список изменений ----------
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("1.9", [
+        "⭐️ Дуэль на звёзды в личке с ботом: .dicep ставка, .bal, .cancel",
+    ]),
     ("1.8", [
         "🎲 Добавлена команда .dice — каждый бросает кубик, у кого больше, тот победил",
     ]),
@@ -2046,6 +2425,7 @@ async def start_web_server() -> web.AppRunner:
 
 async def main():
     await init_db()
+    await stars_recover()  # вернуть ставки из игр, прерванных перезапуском
     runner = await start_web_server()
 
     try:
