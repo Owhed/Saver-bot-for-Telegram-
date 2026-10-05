@@ -116,6 +116,14 @@ async def init_db():
         )
     ''')
 
+    # Включённый режим стилизации (.tsundere / .kawaii) для каждого владельца
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS style_modes (
+            connection_id TEXT PRIMARY KEY,
+            mode TEXT
+        )
+    ''')
+
     await db_conn.commit()
     logging.info("База данных SQLite успешно запущена!")
 
@@ -139,46 +147,87 @@ async def cmd_help(message: types.Message):
     await message.answer(HELP_TEXT, parse_mode=None)
 
 
-# ---------- /nsfw: картинка 18+ под спойлером (только в личке с ботом) ----------
+# ---------- .nsfw: картинка 18+ под спойлером в чат с собеседником ----------
 
-NSFW_API_URL = "https://api.waifu.pics/nsfw/{category}"
-NSFW_CATEGORIES = ["waifu", "neko", "trap", "blowjob"]
+def _first(d, *path):
+    """Достаёт значение по пути из словарей/списков, иначе None."""
+    for key in path:
+        try:
+            d = d[key]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return d
+
+
+def _nekosapi_url(d):
+    items = d if isinstance(d, list) else d.get("items") or d.get("data") or []
+    return _first(items, 0, "url") or _first(items, 0, "image_url")
+
+
+# Несколько независимых источников: если один недоступен (DNS, блокировка), берётся следующий
+NSFW_SOURCES = [
+    ("https://api.waifu.pics/nsfw/waifu", lambda d: d.get("url")),
+    ("https://api.waifu.pics/nsfw/neko", lambda d: d.get("url")),
+    ("https://api.waifu.im/search?is_nsfw=true&limit=1", lambda d: _first(d, "images", 0, "url")),
+    ("https://nekobot.xyz/api/image?type=hentai", lambda d: d.get("message")),
+    ("https://nekobot.xyz/api/image?type=hass", lambda d: d.get("message")),
+    ("https://purrbot.site/api/img/nsfw/neko/img", lambda d: d.get("link")),
+    ("https://purrbot.site/api/img/nsfw/neko/gif", lambda d: d.get("link")),
+    ("https://api.nekosapi.com/v4/images/random?rating=explicit&limit=1", _nekosapi_url),
+]
+
+NSFW_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SaverBot/1.0)"}
 
 
 async def fetch_nsfw_url() -> str | None:
-    category = random.choice(NSFW_CATEGORIES)
-    timeout = aiohttp.ClientTimeout(total=10)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(NSFW_API_URL.format(category=category)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-                return data.get("url")
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logging.warning(f"[NSFW] Ошибка запроса к API: {e}")
-        return None
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout, headers=NSFW_HEADERS) as session:
+        for api_url, extract in random.sample(NSFW_SOURCES, len(NSFW_SOURCES)):
+            try:
+                async with session.get(api_url) as resp:
+                    if resp.status != 200:
+                        logging.info(f"[NSFW] {api_url}: HTTP {resp.status}")
+                        continue
+                    data = await resp.json(content_type=None)
+                url = extract(data)
+                if isinstance(url, str) and url.startswith("http"):
+                    return url
+            except Exception as e:
+                logging.warning(f"[NSFW] Источник {api_url} не ответил: {e}")
+    return None
 
 
-@dp.message(Command("nsfw"))
-async def cmd_nsfw(message: types.Message):
-    if message.chat.type != "private":
-        await message.answer("🔞 Команда доступна только в личке с ботом.")
-        return
+async def send_nsfw(message: types.Message, owner_id: int):
+    conn_id = message.business_connection_id
+    chat_id = message.chat.id
 
     url = await fetch_nsfw_url()
     if not url:
-        await message.answer("Не удалось получить картинку, попробуйте позже.")
+        await try_delete_message(conn_id, message.message_id)
+        await notify_owner(owner_id, "🔞 Не удалось получить картинку: все источники недоступны, попробуйте позже.")
         return
 
+    is_anim = url.lower().endswith((".gif", ".mp4"))
+    sender = bot.send_animation if is_anim else bot.send_photo
+    arg = "animation" if is_anim else "photo"
+
     try:
-        if url.lower().endswith((".gif", ".mp4")):
-            await message.answer_animation(animation=url, has_spoiler=True)
-        else:
-            await message.answer_photo(photo=url, has_spoiler=True)
+        # Сначала по ссылке — Telegram сам скачает файл
+        await sender(chat_id=chat_id, business_connection_id=conn_id, has_spoiler=True, **{arg: url})
     except Exception as e:
-        logging.warning(f"[NSFW] Не удалось отправить {url}: {e}")
-        await message.answer("Не получилось отправить картинку, попробуйте ещё раз.")
+        logging.info(f"[NSFW] Отправка по ссылке не удалась ({e}), скачиваю файл сам")
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout, headers=NSFW_HEADERS) as session:
+                async with session.get(url) as resp:
+                    data = await resp.read()
+            upload = BufferedInputFile(data, filename="img.gif" if is_anim else "img.jpg")
+            await sender(chat_id=chat_id, business_connection_id=conn_id, has_spoiler=True, **{arg: upload})
+        except Exception as e2:
+            logging.error(f"[NSFW] Не удалось отправить {url}: {e2}")
+            await notify_owner(owner_id, f"❌ Не удалось отправить картинку: {e2}")
+
+    await try_delete_message(conn_id, message.message_id)  # убираем сообщение-команду
 
 
 def get_owner_chat_id(conn_info: types.BusinessConnection) -> int:
@@ -383,7 +432,8 @@ async def handle_style_command(message: types.Message) -> bool:
         return False  # команды работают только у владельца аккаунта
 
     if len(parts) < 2:
-        return True  # команда без текста — ничего не делаем
+        await toggle_style_mode(message, owner_id, command)  # без текста — включить/выключить режим
+        return True
 
     new_text = STYLE_COMMANDS[command](parts[1])[:4096]
     try:
@@ -399,12 +449,85 @@ async def handle_style_command(message: types.Message) -> bool:
     return True
 
 
+STYLE_MODE_CACHE: dict[str, str | None] = {}
+
+
+async def get_style_mode(conn_id: str) -> str | None:
+    if conn_id in STYLE_MODE_CACHE:
+        return STYLE_MODE_CACHE[conn_id]
+    async with db_conn.execute(
+        "SELECT mode FROM style_modes WHERE connection_id = ?", (conn_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    mode = row[0] if row and row[0] in STYLE_COMMANDS else None
+    STYLE_MODE_CACHE[conn_id] = mode
+    return mode
+
+
+async def set_style_mode(conn_id: str, mode: str | None):
+    STYLE_MODE_CACHE[conn_id] = mode
+    if mode:
+        await db_conn.execute(
+            "INSERT OR REPLACE INTO style_modes (connection_id, mode) VALUES (?, ?)", (conn_id, mode)
+        )
+    else:
+        await db_conn.execute("DELETE FROM style_modes WHERE connection_id = ?", (conn_id,))
+    await db_conn.commit()
+
+
+async def toggle_style_mode(message: types.Message, owner_id: int, command: str):
+    """.tsundere / .kawaii без текста: включает режим, повторно — выключает. Режимы взаимоисключающие."""
+    conn_id = message.business_connection_id
+    current = await get_style_mode(conn_id)
+    label = command[1:]
+
+    if current == command:
+        await set_style_mode(conn_id, None)
+        note = f"❌ Режим {label} выключен."
+    else:
+        await set_style_mode(conn_id, command)
+        note = f"✅ Режим {label} включён: все ваши сообщения будут оформляться в этом стиле."
+        if current:
+            note += f"\n(Режим {current[1:]} выключен.)"
+        note += f"\nЧтобы выключить, напишите {command} ещё раз."
+
+    await try_delete_message(conn_id, message.message_id)
+    try:
+        await bot.send_message(chat_id=owner_id, text=note)
+    except Exception as e:
+        logging.info(f"[РЕЖИМ] Не удалось отправить подтверждение владельцу: {e}")
+
+
+async def style_text_for_mode(message: types.Message) -> str | None:
+    """Если включён режим, возвращает переписанный текст сообщения владельца, иначе None."""
+    conn_id = message.business_connection_id
+    text = message.text
+    if not conn_id or not text or not message.from_user:
+        return None
+
+    mode = await get_style_mode(conn_id)
+    if not mode:
+        return None
+
+    owner_id = await ensure_connection_owner(conn_id)
+    if message.from_user.id != owner_id:
+        return None
+
+    stripped = text.strip()
+    if len(stripped) < 2 or stripped.startswith((".", "/")):
+        return None  # команды и одиночные символы (ходы в игре) не трогаем
+    if message.entities:
+        return None  # ссылки, упоминания и т.п. сломались бы при переписывании
+
+    return STYLE_COMMANDS[mode](stripped)[:4096]
+
+
 # ---------- .help и крестики-нолики (.ttt) ----------
 
 HELP_TEXT = (
     "✨ Команды (работают в бизнес-чатах, только у владельца):\n\n"
-    ".tsundere текст — сообщение в стиле цундере\n"
-    ".kawaii текст — пикми-режим\n"
+    ".tsundere — включить/выключить режим цундере (или .tsundere текст — один раз)\n"
+    ".kawaii — включить/выключить пикми-режим (или .kawaii текст — один раз)\n"
     ".ttt — крестики-нолики с собеседником (ходы цифрами 1–9)\n"
     ".ttt stop — остановить игру\n"
     ".neko — случайная картинка с кошкодевочкой\n"
@@ -421,9 +544,8 @@ HELP_TEXT = (
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
     ".underline — включить/выключить подчёркивание\n"
-    ".help — этот список\n\n"
-    "В личке с ботом:\n"
-    "/nsfw — картинка 18+ под спойлером"
+    ".nsfw — картинка 18+ под спойлером (уходит в чат с собеседником)\n"
+    ".help — этот список"
 )
 
 # Активные игры: chat_id -> состояние (хранятся в памяти, при перезапуске бота сбрасываются)
@@ -1186,18 +1308,18 @@ async def toggle_format(message: types.Message, owner_id: int, style: str):
         logging.info(f"[ФОРМАТ] Не удалось отправить подтверждение владельцу: {e}")
 
 
-async def apply_auto_format(message: types.Message):
+async def apply_auto_format(message: types.Message, text_override: str | None = None):
     """Оформляет каждое сообщение владельца включёнными стилями."""
     conn_id = message.business_connection_id
     if not conn_id or not message.from_user:
         return
 
-    text = message.text or message.caption
+    text = text_override or message.text or message.caption
     if not text or not text.strip():
         return
 
     styles = await get_styles(conn_id)
-    if not styles:
+    if not styles and text_override is None:
         return
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -1205,7 +1327,7 @@ async def apply_auto_format(message: types.Message):
         return
 
     is_caption = message.text is None
-    existing = list((message.caption_entities if is_caption else message.entities) or [])
+    existing = [] if text_override else list((message.caption_entities if is_caption else message.entities) or [])
 
     # Код/pre нельзя совмещать с другими стилями — не трогаем такие сообщения
     if any(e.type in ("code", "pre") for e in existing):
@@ -1231,7 +1353,7 @@ async def apply_auto_format(message: types.Message):
             )
         else:
             await bot.edit_message_text(
-                text=text, entities=entities,
+                text=text, entities=entities or None,
                 business_connection_id=conn_id, chat_id=message.chat.id,
                 message_id=message.message_id,
             )
@@ -1423,7 +1545,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".duel", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".love", ".gif", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".nsfw", ".duel", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".love", ".gif", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -1445,6 +1567,14 @@ async def handle_help_and_games(message: types.Message) -> bool:
 
     if command == ".neko":
         await send_neko(message)
+        return True
+
+    if command == ".nsfw":
+        if message.chat.id != owner_id:
+            await send_nsfw(message, owner_id)
+        else:
+            await try_delete_message(conn_id, message.message_id)
+            await notify_owner(owner_id, "🔞 Команду .nsfw нужно писать в чате с собеседником.")
         return True
 
     if command == ".duel":
@@ -1519,7 +1649,8 @@ async def handle_business_message(message: types.Message):
         logging.error(f"Ошибка в handle_help_and_games: {e}")
 
     try:
-        await apply_auto_format(message)
+        styled = await style_text_for_mode(message)
+        await apply_auto_format(message, text_override=styled)
     except Exception as e:
         logging.error(f"Ошибка в apply_auto_format: {e}")
 
@@ -1538,13 +1669,64 @@ async def handle_business_message(message: types.Message):
         logging.error(f"Ошибка в forward_one_time_media: {e}")
 
 
-# 2.1 Редактирование сообщений — обновляем кэш, чтобы при удалении был актуальный текст
+# 2.1 Редактирование сообщений: обновляем кэш и сообщаем владельцу, что собеседник изменил сообщение
+EDIT_PART_LIMIT = 1500  # максимум символов для «было» и «стало»
+
+
+async def notify_edit(message: types.Message, old_row: tuple):
+    conn_id = message.business_connection_id
+    owner_id = await ensure_connection_owner(conn_id) if conn_id else None
+    if not owner_id:
+        return
+    # Свои правки (в том числе команды бота) владельцу показывать не нужно
+    if message.from_user and message.from_user.id == owner_id:
+        return
+
+    sender_name, username, old_text, old_file_id, old_media = old_row
+    new_text, new_file_id, _ = extract_content(message)
+    old_text, new_text = old_text or "", new_text or ""
+
+    media_changed = bool(old_file_id and new_file_id and old_file_id != new_file_id)
+    if old_text == new_text and not media_changed:
+        return  # изменилось только форматирование или ничего существенного
+
+    notification = (
+        f"✏️ <b>Сообщение изменено!</b>\n\n"
+        f"👤 <b>Отправитель:</b> {html.escape(sender_name or '')} ({html.escape(username or '')})\n\n"
+        f"📄 <b>Было:</b> {html.escape(old_text[:EDIT_PART_LIMIT])}\n\n"
+        f"📝 <b>Стало:</b> {html.escape(new_text[:EDIT_PART_LIMIT])}"
+    )
+    if media_changed:
+        notification += "\n\n🖼 Медиафайл тоже был заменён (ниже прежняя версия)."
+
+    try:
+        if media_changed:
+            await send_deleted_notice(owner_id, notification, old_file_id, old_media)
+        else:
+            await bot.send_message(chat_id=owner_id, text=notification[:4000], parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"[ПРАВКА] Не удалось отправить уведомление владельцу {owner_id}: {e}")
+
+
 @dp.edited_business_message()
 async def handle_edited_business_message(message: types.Message):
     try:
         if await delete_if_muted(message):
             return
-        await save_message(message)
+
+        async with db_conn.execute(
+            "SELECT sender_name, username, text_content, file_id, media_type "
+            "FROM messages WHERE message_id = ? AND chat_id = ?",
+            (message.message_id, message.chat.id)
+        ) as cursor:
+            old_row = await cursor.fetchone()
+
+        await save_message(message)  # обновляем кэш, чтобы при удалении был актуальный текст
+
+        if old_row:
+            await notify_edit(message, old_row)
+        else:
+            logging.info(f"[ПРАВКА] Старой версии сообщения {message.message_id} нет в базе")
     except Exception as e:
         logging.error(f"Ошибка в handle_edited_business_message: {e}")
 
@@ -1706,8 +1888,14 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("1.7", [
+        "🎭 .tsundere и .kawaii теперь включают и выключают режим: все ваши сообщения оформляются в выбранном стиле",
+    ]),
+    ("1.6", [
+        "✏️ Бот сообщает, когда собеседник изменил сообщение: показывает, что было и что стало",
+    ]),
     ("1.5", [
-        "🔞 Добавлена команда /nsfw в личке с ботом — картинка 18+ под спойлером",
+        "🔞 Добавлена команда .nsfw — картинка 18+ под спойлером в чат с собеседником",
     ]),
     ("1.4", [
         "🎞 Добавлена команда .gif — гифка из фото, видео или кружка",
