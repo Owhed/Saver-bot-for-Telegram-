@@ -532,6 +532,7 @@ HELP_TEXT = (
     ".ttt stop — остановить игру\n"
     ".neko — случайная картинка с кошкодевочкой\n"
     ".duel — дуэль с собеседником, победителя решает случай\n"
+    ".dice — бросить по кубику: у кого больше, тот победил\n"
     ".text — расшифровать голосовое или кружок (ответом на него)\n"
     ".video ссылка — скачать видео (TikTok, YouTube и др.) и отправить в чат\n"
     ".mute — не давать собеседнику писать (его сообщения удаляются)\n"
@@ -544,7 +545,6 @@ HELP_TEXT = (
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
     ".underline — включить/выключить подчёркивание\n"
-    ".nsfw — картинка 18+ под спойлером (уходит в чат с собеседником)\n"
     ".help — этот список"
 )
 
@@ -1245,6 +1245,65 @@ async def run_duel(message: types.Message):
         DUEL_RUNNING.discard(key)
 
 
+# ---------- Кубики (.dice) ----------
+
+DICE_RUNNING: set = set()
+DICE_ANIMATION_DELAY = 4.0   # столько идёт анимация кубика в Telegram
+DICE_MAX_ROUNDS = 5          # при ничьей перебрасываем, но не бесконечно
+
+
+async def run_dice(message: types.Message):
+    """.dice — каждый из двоих бросает кубик, у кого больше — тот победил."""
+    key = game_key(message)
+    if key in DICE_RUNNING:
+        return  # в этом чате бросок уже идёт
+    DICE_RUNNING.add(key)
+
+    try:
+        conn_id = message.business_connection_id
+        chat = message.chat
+        names = [
+            message.from_user.full_name,
+            getattr(chat, "full_name", None) or chat.first_name or "Соперник",
+        ]
+        ctx = {"conn_id": conn_id, "msg_id": message.message_id}  # команда превращается в табло
+
+        header = (
+            f"🎲 Кубики!\n"
+            f"1-й кубик — {names[0]}\n"
+            f"2-й кубик — {names[1]}\n\n"
+        )
+        await update_board(ctx, chat.id, header + "Бросаем...")
+
+        values = (0, 0)
+        for attempt in range(1, DICE_MAX_ROUNDS + 1):
+            first = await bot.send_dice(chat_id=chat.id, business_connection_id=conn_id, emoji="🎲")
+            second = await bot.send_dice(chat_id=chat.id, business_connection_id=conn_id, emoji="🎲")
+            values = (first.dice.value, second.dice.value)
+
+            await asyncio.sleep(DICE_ANIMATION_DELAY)  # даём анимации закончиться, чтобы не спойлерить результат
+
+            if values[0] != values[1]:
+                break
+            if attempt < DICE_MAX_ROUNDS:
+                await update_board(ctx, chat.id, header + f"{values[0]} : {values[1]} — ничья! Бросаем ещё раз...")
+                await asyncio.sleep(1.5)
+
+        score = f"{names[0]}: {values[0]}\n{names[1]}: {values[1]}\n\n"
+        if values[0] > values[1]:
+            result = f"🏆 Победил {names[0]}!"
+        elif values[1] > values[0]:
+            result = f"🏆 Победил {names[1]}!"
+        else:
+            result = "🤝 Ничья!"
+        await update_board(ctx, chat.id, header + score + result)
+        logging.info(f"[КУБИКИ] Чат {chat.id}: {values[0]} : {values[1]}")
+    except Exception as e:
+        logging.error(f"[КУБИКИ] Ошибка: {e}")
+    finally:
+        DICE_RUNNING.discard(key)
+
+
 # ---------- Авто-форматирование: .bold .italic .monospace .underline ----------
 
 FORMAT_COMMANDS = {
@@ -1545,7 +1604,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".nsfw", ".duel", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".love", ".gif", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".nsfw", ".duel", ".dice", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".love", ".gif", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -1580,6 +1639,14 @@ async def handle_help_and_games(message: types.Message) -> bool:
     if command == ".duel":
         if message.chat.id != owner_id:
             await run_duel(message)
+        return True
+
+    if command == ".dice":
+        if message.chat.id != owner_id:
+            await run_dice(message)
+        else:
+            await try_delete_message(conn_id, message.message_id)
+            await notify_owner(owner_id, "🎲 Команду .dice нужно писать в чате с собеседником.")
         return True
 
     if command == ".text":
@@ -1888,6 +1955,9 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("1.8", [
+        "🎲 Добавлена команда .dice — каждый бросает кубик, у кого больше, тот победил",
+    ]),
     ("1.7", [
         "🎭 .tsundere и .kawaii теперь включают и выключают режим: все ваши сообщения оформляются в выбранном стиле",
     ]),
