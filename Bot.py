@@ -182,6 +182,18 @@ async def init_db():
             created INTEGER
         )
     ''')
+
+    # Донаты (/donate): звёзды, отправленные боту в поддержку
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS donations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            username TEXT,
+            amount INTEGER,
+            created INTEGER
+        )
+    ''')
     # Подтягиваем уже известных пользователей (владельцы подключений и игроки)
     await db_conn.execute(
         "INSERT OR IGNORE INTO bot_users (user_id, name, started) "
@@ -727,7 +739,8 @@ HELP_TEXT = (
     ".dicep ставка — создать дуэль на кубиках (по умолчанию 50 ⭐️)\n"
     ".bal — игровой баланс\n"
     ".cancel — отменить свои игры, которые ещё не начались (или .cancel N — игру №N); ставка вернётся на игровой баланс\n"
-    ".withdraw — вывод от 50 ⭐️ (заявка уходит админу); .withdraw сумма — вывести часть"
+    ".withdraw — вывод от 50 ⭐️ (заявка уходит админу); .withdraw сумма — вывести часть\n"
+    "/donate — поддержать бота звёздами (выбор суммы, затем оплата)"
 )
 
 # Активные игры: chat_id -> состояние (хранятся в памяти, при перезапуске бота сбрасываются)
@@ -2441,10 +2454,86 @@ async def start_rolling(game_id: int):
     spawn(run_game_logic(game_id))
 
 
+# --- донаты: /donate ---
+
+DONATE_PRESETS = [10, 25, 50, 100, 250, 500]
+DONATE_MAX = 10000
+
+
+def donate_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(DONATE_PRESETS), 3):
+        rows.append([
+            InlineKeyboardButton(text=f"{a} ⭐️", callback_data=f"donate_{a}")
+            for a in DONATE_PRESETS[i:i + 3]
+        ])
+    rows.append([InlineKeyboardButton(text="✏️ Другая сумма", callback_data="donate_custom")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_donate_invoice(chat_id: int, user_id: int, amount: int):
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="Поддержка бота",
+        description=f"Донат {amount} ⭐️. Спасибо, что помогаете боту развиваться!",
+        payload=f"donate_{user_id}_{amount}",
+        currency="XTR",
+        prices=[LabeledPrice(label="Донат", amount=amount)],
+    )
+
+
+@stars_router.message(F.chat.type == "private", Command("donate"))
+async def cmd_donate(message: types.Message, command: CommandObject):
+    """/donate — выбрать сумму кнопками; /donate 75 — сразу счёт на свою сумму."""
+    arg = (command.args or "").strip()
+    if arg:
+        if not arg.isdigit() or not 1 <= int(arg) <= DONATE_MAX:
+            return await message.answer(f"❌ Сумма должна быть числом от 1 до {DONATE_MAX} ⭐️. Пример: /donate 75")
+        return await send_donate_invoice(message.chat.id, message.from_user.id, int(arg))
+
+    await message.answer(
+        "💖 Сколько звёзд хотите отправить в поддержку бота?\nВыберите сумму:",
+        reply_markup=donate_keyboard(),
+    )
+
+
+@stars_router.callback_query(F.data == "donate_custom")
+async def cb_donate_custom(call: types.CallbackQuery):
+    await call.answer()
+    await bot.send_message(call.from_user.id, f"✏️ Напишите сумму командой, например: /donate 75 (от 1 до {DONATE_MAX} ⭐️)")
+
+
+@stars_router.callback_query(F.data.regexp(r"^donate_\d+$"))
+async def cb_donate(call: types.CallbackQuery):
+    amount = int(call.data.split("_", 1)[1])
+    if not 1 <= amount <= DONATE_MAX:
+        return await call.answer("Неверная сумма.", show_alert=True)
+    await call.answer()
+    await send_donate_invoice(call.from_user.id, call.from_user.id, amount)
+
+
+async def handle_donation(message: types.Message):
+    pay = message.successful_payment
+    user = message.from_user
+    amount = pay.total_amount
+    await db_conn.execute(
+        "INSERT INTO donations (user_id, name, username, amount, created) VALUES (?, ?, ?, ?, ?)",
+        (user.id, user.full_name, user.username or "", amount, int(time.time())),
+    )
+    await db_conn.commit()
+    request_backup()
+
+    await message.answer(f"💖 Спасибо за поддержку! Получено {amount} ⭐️.")
+    uname = f"@{user.username}" if user.username else "без username"
+    await safe_send(ADMIN_ID, f"💖 Новый донат: {amount} ⭐️\nОт: {user.full_name} ({uname}), ID {user.id}")
+
+
 # --- оплата звёздами ---
 
 @stars_router.pre_checkout_query()
 async def stars_pre_checkout(query: PreCheckoutQuery):
+    if query.invoice_payload.startswith("donate_"):
+        return await query.answer(ok=True)
     kind, _, gid = query.invoice_payload.rpartition("_")
     game = await get_game(int(gid)) if gid.isdigit() else None
     ok = False
@@ -2459,6 +2548,8 @@ async def stars_pre_checkout(query: PreCheckoutQuery):
 @stars_router.message(F.successful_payment)
 async def stars_payment(message: types.Message):
     pay = message.successful_payment
+    if pay.invoice_payload.startswith("donate_"):
+        return await handle_donation(message)
     user_id = message.from_user.id
     kind, _, gid = pay.invoice_payload.rpartition("_")
     game_id = int(gid) if gid.isdigit() else None
@@ -2720,7 +2811,7 @@ async def run_broadcast(ids: list, text: str, reply: types.Message | None, admin
 
 # --- резервные копии: баланс и игры не пропадают, даже если хостинг стёр файл базы ---
 
-BACKUP_TABLES = ["users", "bot_users", "connections", "stars_games", "withdrawals", "style_modes", "formats", "muted_chats", "duels"]
+BACKUP_TABLES = ["users", "bot_users", "connections", "stars_games", "withdrawals", "donations", "style_modes", "formats", "muted_chats", "duels"]
 BACKUP_INTERVAL = 3 * 3600   # регулярная копия раз в 3 часа (если что-то изменилось)
 BACKUP_DEBOUNCE = 20         # и через 20 секунд после любого движения звёзд
 _last_backup_hash: str | None = None
@@ -2895,6 +2986,9 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("2.3", [
+        "💖 Команда /donate: выберите сумму и поддержите бота звёздами",
+    ]),
     ("2.2", [
         "💸 Вывод звёзд от 50 ⭐️: .withdraw, заявка уходит админу",
     ]),
