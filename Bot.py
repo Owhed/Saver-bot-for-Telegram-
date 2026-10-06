@@ -161,7 +161,25 @@ async def init_db():
             user_id INTEGER PRIMARY KEY,
             name TEXT,
             started INTEGER,
-            blocked INTEGER DEFAULT 0
+            blocked INTEGER DEFAULT 0,
+            username TEXT
+        )
+    ''')
+    try:  # для баз, созданных до появления колонки username
+        await db_conn.execute("ALTER TABLE bot_users ADD COLUMN username TEXT")
+    except Exception:
+        pass
+
+    # Заявки на вывод звёзд (все приходят админу)
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            username TEXT,
+            amount INTEGER,
+            status TEXT,
+            created INTEGER
         )
     ''')
     # Подтягиваем уже известных пользователей (владельцы подключений и игроки)
@@ -184,9 +202,9 @@ async def register_user(user: types.User | None):
         return
     try:
         await db_conn.execute(
-            "INSERT INTO bot_users (user_id, name, started, blocked) VALUES (?, ?, ?, 0) "
-            "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, blocked = 0",
-            (user.id, user.full_name, int(time.time())),
+            "INSERT INTO bot_users (user_id, name, username, started, blocked) VALUES (?, ?, ?, ?, 0) "
+            "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, username = excluded.username, blocked = 0",
+            (user.id, user.full_name, (user.username or "").lower(), int(time.time())),
         )
         await db_conn.commit()
     except Exception as e:
@@ -709,7 +727,7 @@ HELP_TEXT = (
     ".dicep ставка — создать дуэль на кубиках (по умолчанию 50 ⭐️)\n"
     ".bal — игровой баланс\n"
     ".cancel — отменить свои игры, которые ещё не начались (или .cancel N — игру №N); ставка вернётся на игровой баланс\n"
-    ".withdraw — вывод (пока недоступен)"
+    ".withdraw — вывод от 50 ⭐️ (заявка уходит админу); .withdraw сумма — вывести часть"
 )
 
 # Активные игры: chat_id -> состояние (хранятся в памяти, при перезапуске бота сбрасываются)
@@ -2216,112 +2234,144 @@ async def cmd_bal(message: types.Message):
     await message.answer(f"💳 <b>Ваш игровой баланс:</b> {balance} ⭐️", parse_mode="HTML")
 
 
-@stars_router.message(F.chat.type == "private", F.text == ".withdraw")
+# --- вывод звёзд: заявки приходят админу ---
+
+WITHDRAW_MIN = 50
+WD_COLS = "id, user_id, name, username, amount, status"
+
+
+async def get_withdrawal(wid: int) -> dict | None:
+    async with db_conn.execute(f"SELECT {WD_COLS} FROM withdrawals WHERE id = ?", (wid,)) as cur:
+        row = await cur.fetchone()
+    return dict(zip(WD_COLS.split(", "), row)) if row else None
+
+
+def withdraw_keyboard(wid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Выплачено", callback_data=f"wd_paid_{wid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd_rej_{wid}"),
+    ]])
+
+
+def withdraw_text(w: dict, status_line: str = "") -> str:
+    uname = f"@{w['username']}" if w.get("username") else "нет юзернейма"
+    text = (
+        f"💸 <b>Заявка на вывод #{w['id']}</b>\n\n"
+        f"👤 <a href=\"tg://user?id={w['user_id']}\">{html.escape(w.get('name') or 'без имени')}</a> ({html.escape(uname)})\n"
+        f"🆔 <code>{w['user_id']}</code>\n"
+        f"⭐️ Сумма: <b>{w['amount']}</b>"
+    )
+    if status_line:
+        text += f"\n\n{status_line}"
+    return text
+
+
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.withdraw(\s+\d+)?$"))
 async def cmd_withdraw(message: types.Message):
-    await message.answer("⚠️ Вывод пока недоступен. Баланс можно использовать только для ставок.")
-
-
-@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.dicep(\s|$)"))
-async def cmd_dicep(message: types.Message):
+    """.withdraw — вывести весь баланс (от 50 ⭐️); .withdraw сумма — вывести часть."""
     user = message.from_user
     parts = message.text.split()
-    bet = 50
-    if len(parts) > 1:
-        if not parts[1].isdigit():
-            return await message.answer("❌ Ставка должна быть числом: .dicep 50")
-        bet = int(parts[1])
-    if not STARS_MIN_BET <= bet <= STARS_MAX_BET:
-        return await message.answer(f"❌ Ставка от {STARS_MIN_BET} до {STARS_MAX_BET} ⭐️")
+    balance = await get_balance(user.id)
+    amount = int(parts[1]) if len(parts) > 1 else balance
 
-    if await try_deduct(user.id, bet):
-        game_id = await create_game(user.id, user.full_name, bet, "ready_for_p2")
-        await send_invite(message.chat.id, game_id)
+    if amount < WITHDRAW_MIN:
+        return await message.answer(
+            f"❌ Минимальная сумма вывода — {WITHDRAW_MIN} ⭐️. Ваш баланс: {balance} ⭐️."
+        )
+    if amount > balance:
+        return await message.answer(f"❌ Недостаточно средств: на балансе {balance} ⭐️.")
+
+    # Списание и создание заявки — одной транзакцией, чтобы звёзды не потерялись
+    cur = await db_conn.execute(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+        (amount, user.id, amount),
+    )
+    if not cur.rowcount:
+        return await message.answer("❌ Недостаточно средств.")
+    cur = await db_conn.execute(
+        "INSERT INTO withdrawals (user_id, name, username, amount, status, created) VALUES (?, ?, ?, ?, 'pending', ?)",
+        (user.id, user.full_name, user.username or "", amount, int(time.time())),
+    )
+    wid = cur.lastrowid
+    await db_conn.commit()
+    request_backup()
+
+    await message.answer(
+        f"✅ Заявка #{wid} на вывод {amount} ⭐️ отправлена администратору.\n"
+        f"Звёзды списаны с баланса. Если заявку отклонят, они вернутся."
+    )
+    w = await get_withdrawal(wid)
+    try:
+        await bot.send_message(ADMIN_ID, withdraw_text(w), parse_mode="HTML", reply_markup=withdraw_keyboard(wid))
+    except Exception as e:
+        logging.error(f"[WITHDRAW] Не удалось отправить заявку #{wid} админу: {e}")
+
+
+@stars_router.callback_query(F.data.regexp(r"^wd_(paid|rej)_\d+$"))
+async def cb_withdraw(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return await call.answer("Только для администратора.", show_alert=True)
+
+    _, action, wid_s = call.data.split("_")
+    wid = int(wid_s)
+    w = await get_withdrawal(wid)
+    if not w:
+        return await call.answer("Заявка не найдена.", show_alert=True)
+
+    new_status = "paid" if action == "paid" else "rejected"
+    cur = await db_conn.execute(
+        "UPDATE withdrawals SET status = ? WHERE id = ? AND status = 'pending'", (new_status, wid)
+    )
+    await db_conn.commit()
+    if not cur.rowcount:
+        return await call.answer(f"Заявка уже обработана ({w['status']}).", show_alert=True)
+
+    if new_status == "paid":
+        status_line = "✅ Выплачено"
+        await safe_send(w["user_id"], f"✅ Заявка #{wid} на вывод {w['amount']} ⭐️ выполнена. Звёзды отправлены вам.")
     else:
-        game_id = await create_game(user.id, user.full_name, bet, "waiting_p1_payment")
-        await bot.send_invoice(
-            chat_id=message.chat.id,
-            title=f"Создание игры #{game_id}",
-            description=f"Оплатите ставку {bet} ⭐️",
-            payload=f"p1_pay_{game_id}",
-            currency="XTR",
-            prices=[LabeledPrice(label=f"Ставка в игре #{game_id}", amount=bet)],
-        )
+        await add_balance(w["user_id"], w["amount"])
+        status_line = "❌ Отклонено, звёзды возвращены на баланс игрока"
+        await safe_send(w["user_id"], f"❌ Заявка #{wid} на вывод отклонена. {w['amount']} ⭐️ возвращены на игровой баланс.")
+
+    request_backup()
+    try:
+        await call.message.edit_text(withdraw_text(w, status_line), parse_mode="HTML", reply_markup=None)
+    except Exception as e:
+        logging.info(f"[WITHDRAW] Не удалось обновить сообщение заявки: {e}")
+    await call.answer("Готово")
 
 
-async def cancel_game(game_id: int, user_id: int) -> str:
-    """Отменяет игру, которая ещё не началась. Ставка возвращается на игровой баланс."""
-    game = await get_game(game_id)
-    if not game:
-        return f"❌ Игра #{game_id} не найдена или уже завершена."
+# --- начисление баланса по @username (только админ) ---
 
-    status = game["status"]
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.send(\s|$)"))
+async def cmd_send(message: types.Message):
+    """.send @username сумма — админ начисляет звёзды на игровой баланс игрока."""
+    user = message.from_user
+    if user.id != ADMIN_ID:
+        return await message.answer("⛔ Эта команда доступна только администратору.")
 
-    # Создатель отменяет свою игру
-    if game["player1"] == user_id:
-        if status == "rolling":
-            return f"⏳ Игра #{game_id} уже идёт: кубики брошены, отменить нельзя."
-        cur = await db_conn.execute("DELETE FROM stars_games WHERE id = ? AND status = ?", (game_id, status))
-        await db_conn.commit()
-        if not cur.rowcount:
-            return f"❌ Игра #{game_id} только что изменилась, попробуйте ещё раз."
-
-        if status == "waiting_p2_payment" and game["player2"]:
-            await safe_send(game["player2"], f"ℹ️ Игра #{game_id} отменена создателем.")
-        if status in ("ready_for_p2", "waiting_p2_payment"):
-            await add_balance(user_id, game["bet"])
-            return f"✅ Игра #{game_id} отменена: {game['bet']} ⭐️ возвращены на игровой баланс."
-        return f"✅ Игра #{game_id} отменена (оплата не поступала, ничего не списано)."
-
-    # Соперник выходит, пока не оплатил вход
-    if game["player2"] == user_id and status == "waiting_p2_payment":
-        cur = await db_conn.execute(
-            "UPDATE stars_games SET player2 = NULL, player2_name = NULL, status = 'ready_for_p2' "
-            "WHERE id = ? AND status = 'waiting_p2_payment' AND player2 = ?", (game_id, user_id)
-        )
-        await db_conn.commit()
-        if cur.rowcount:
-            return f"✅ Вы вышли из игры #{game_id}, ничего не списано."
-        return f"❌ Игра #{game_id} только что изменилась, попробуйте ещё раз."
-
-    return f"❌ Игра #{game_id} вам не принадлежит."
-
-
-@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.cancel(\s+\d+)?$"))
-async def cmd_cancel(message: types.Message):
-    """.cancel — отменить все свои ещё не начатые игры; .cancel N — только игру №N."""
-    user_id = message.from_user.id
-    parts = message.text.split()
-
-    if len(parts) > 1:
-        return await message.answer(await cancel_game(int(parts[1]), user_id))
+    m = re.match(r"^\.send\s+@?(\w+)\s+(\d+)$", message.text.strip())
+    if not m:
+        return await message.answer("Формат: .send @username сумма (например, .send @durov 100)")
+    username, amount = m.group(1).lower(), int(m.group(2))
+    if amount < 1:
+        return await message.answer("❌ Сумма должна быть не меньше 1 ⭐️.")
 
     async with db_conn.execute(
-        "SELECT id FROM stars_games WHERE "
-        "(player1 = ? AND status IN ('ready_for_p2', 'waiting_p1_payment', 'waiting_p2_payment')) "
-        "OR (player2 = ? AND status = 'waiting_p2_payment')",
-        (user_id, user_id),
+        "SELECT user_id, name FROM bot_users WHERE username = ?", (username,)
     ) as cur:
-        ids = [r[0] for r in await cur.fetchall()]
+        row = await cur.fetchone()
+    if not row:
+        return await message.answer(
+            f"❌ @{username} не найден. Человек должен хотя бы раз написать боту (например, /start), "
+            f"и у него должен быть задан username."
+        )
+    to_id, to_name = row
 
-    if not ids:
-        return await message.answer("У вас нет игр, которые можно отменить (начавшуюся игру отменить нельзя).")
-
-    results = []
-    for game_id in ids:
-        results.append(await cancel_game(game_id, user_id))
-    await message.answer("\n".join(results))
-
-
-@stars_router.callback_query(F.data.regexp(r"^cancel_\d+$"))
-async def cb_cancel(call: types.CallbackQuery):
-    game_id = int(call.data.split("_", 1)[1])
-    result = await cancel_game(game_id, call.from_user.id)
-    await call.answer(result[:200], show_alert=True)
-    if result.startswith("✅") and call.message:
-        try:
-            await call.message.edit_text(result, reply_markup=None)
-        except Exception as e:
-            logging.info(f"[STARS] Не удалось обновить сообщение после отмены: {e}")
+    await add_balance(to_id, amount)
+    await message.answer(f"✅ Начислено {amount} ⭐️ → {to_name or '@' + username} (@{username}). Теперь у него: {await get_balance(to_id)} ⭐️")
+    await safe_send(to_id, f"🎁 Вам начислено {amount} ⭐️ на игровой баланс.")
 
 
 # --- присоединение соперника (вызывается из /start join_N) ---
@@ -2580,6 +2630,23 @@ async def cmd_users(message: types.Message):
     await message.answer(f"👥 В списке рассылки: {total}\n🚫 Заблокировали бота: {blocked}\n📬 Получат рассылку: {total - blocked}")
 
 
+@stars_router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, F.text == ".requests")
+@admin_safe
+async def cmd_requests(message: types.Message):
+    """Необработанные заявки на вывод."""
+    async with db_conn.execute(
+        f"SELECT {WD_COLS} FROM withdrawals WHERE status = 'pending' ORDER BY id LIMIT 20"
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return await message.answer("Нет необработанных заявок на вывод.")
+    for row in rows:
+        w = dict(zip(WD_COLS.split(", "), row))
+        await bot.send_message(
+            message.chat.id, withdraw_text(w), parse_mode="HTML", reply_markup=withdraw_keyboard(w["id"])
+        )
+
+
 # --- рассылка всем, кто нажал /start (только админ) ---
 
 BROADCAST_DELAY = 0.06  # ~16 сообщений в секунду, в пределах лимитов Telegram
@@ -2653,7 +2720,7 @@ async def run_broadcast(ids: list, text: str, reply: types.Message | None, admin
 
 # --- резервные копии: баланс и игры не пропадают, даже если хостинг стёр файл базы ---
 
-BACKUP_TABLES = ["users", "bot_users", "connections", "stars_games", "style_modes", "formats", "muted_chats", "duels"]
+BACKUP_TABLES = ["users", "bot_users", "connections", "stars_games", "withdrawals", "style_modes", "formats", "muted_chats", "duels"]
 BACKUP_INTERVAL = 3 * 3600   # регулярная копия раз в 3 часа (если что-то изменилось)
 BACKUP_DEBOUNCE = 20         # и через 20 секунд после любого движения звёзд
 _last_backup_hash: str | None = None
@@ -2828,6 +2895,9 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("2.2", [
+        "💸 Вывод звёзд от 50 ⭐️: .withdraw, заявка уходит админу",
+    ]),
     ("2.1", [
         "❌ Игру на звёзды можно отменить: кнопкой под ссылкой или командой .cancel (.cancel N), ставка вернётся на игровой баланс",
         "💾 Баланс звёзд больше не пропадает при обновлении бота",
