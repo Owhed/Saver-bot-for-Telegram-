@@ -727,9 +727,10 @@ HELP_TEXT = (
     ".mute — не давать собеседнику писать (его сообщения удаляются)\n"
     ".unmute — снять запрет\n"
     ".song название или строчка — найти песню\n"
-    ".spam число текст — отправить текст несколько раз (до 30)\n"
+    ".spam число текст — отправить текст несколько раз (до 250)\n"
     ".love — анимация любви\n"
     ".gif — сделать гифку из фото, видео или кружка (ответом на него)\n"
+    ".gifts — оценить NFT-подарки собеседника в ₽, $ и € (отчёт придёт в чат)\n"
     ".bold — включить/выключить жирный шрифт\n"
     ".italic — включить/выключить курсив\n"
     ".monospace — включить/выключить моноширинный шрифт\n"
@@ -1499,6 +1500,165 @@ async def run_dice(message: types.Message):
         DICE_RUNNING.discard(key)
 
 
+# ---------- Оценка подарков (.gifts) ----------
+
+STAR_USD_BUY = float(os.getenv("STAR_USD_BUY", "0.02"))  # цена 1 ⭐️ в $ (для цены передачи NFT)
+FALLBACK_USD_RUB = float(os.getenv("USD_RUB", "80"))
+FALLBACK_EUR_RUB = float(os.getenv("EUR_RUB", "92"))
+GIFTS_LIST_LIMIT = 25  # сколько NFT показывать списком (остальные — в итоге)
+
+
+def load_gift_floors() -> dict[str, float]:
+    """Флор-цены коллекций в $: GIFT_FLOORS='{"Plush Pepe": 3000, "Durov's Cap": 1200}'.
+    Bot API не отдаёт рыночную цену NFT, поэтому её можно задать вручную."""
+    try:
+        raw = json.loads(os.getenv("GIFT_FLOORS", "") or "{}")
+        return {str(k).strip().lower(): float(v) for k, v in raw.items()}
+    except Exception as e:
+        logging.warning(f"[GIFTS] Не удалось разобрать GIFT_FLOORS: {e}")
+        return {}
+
+
+GIFT_FLOORS = load_gift_floors()
+
+
+async def fetch_fiat_rates() -> tuple[float, float, bool]:
+    """Курсы ЦБ РФ: (RUB за 1 USD, RUB за 1 EUR, получены ли актуальные)."""
+    timeout = aiohttp.ClientTimeout(total=8)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://www.cbr-xml-daily.ru/daily_json.js") as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                data = await resp.json(content_type=None)
+        v = data["Valute"]
+        usd = v["USD"]["Value"] / v["USD"]["Nominal"]
+        eur = v["EUR"]["Value"] / v["EUR"]["Nominal"]
+        return usd, eur, True
+    except Exception as e:
+        logging.warning(f"[GIFTS] Не удалось получить курсы: {e}")
+        return FALLBACK_USD_RUB, FALLBACK_EUR_RUB, False
+
+
+async def fetch_all_gifts(conn_id: str, user_id: int | None = None) -> list:
+    """Подарки собеседника (user_id) через getUserGifts; без user_id — подарки самого аккаунта владельца."""
+    gifts, offset = [], None
+    for _ in range(50):  # защита от бесконечного цикла
+        if user_id is not None:
+            page = await bot.get_user_gifts(user_id=user_id, offset=offset, limit=100)
+        else:
+            page = await bot.get_business_account_gifts(
+                business_connection_id=conn_id, offset=offset, limit=100
+            )
+        gifts.extend(page.gifts)
+        offset = page.next_offset
+        if not offset:
+            break
+    return gifts
+
+
+def format_usd(usd: float, usd_rub: float, eur_rub: float) -> str:
+    rub = usd * usd_rub
+    eur = rub / eur_rub
+    return f"{rub:,.0f} ₽ | ${usd:,.2f} | €{eur:,.2f}".replace(",", " ")
+
+
+def nft_price_usd(g) -> tuple[float | None, str]:
+    """Цена NFT в $ и источник: флор из GIFT_FLOORS, иначе цена передачи, иначе None."""
+    ug = getattr(g, "gift", None)
+    base = (getattr(ug, "base_name", None) or "").strip().lower()
+    if base and base in GIFT_FLOORS:
+        return GIFT_FLOORS[base], "флор"
+    ts = getattr(g, "transfer_star_count", None)
+    if ts:
+        return ts * STAR_USD_BUY, "передача"
+    return None, ""
+
+
+async def handle_gifts_command(message: types.Message, owner_id: int):
+    """.gifts — оценка NFT-подарков собеседника (того, в чьём чате написана команда).
+    Результат отправляется прямо в чат с собеседником: команда превращается в отчёт.
+    В своём чате (Избранное) оценивает NFT самого владельца и шлёт отчёт в личку с ботом."""
+    conn_id = message.business_connection_id
+    chat = message.chat
+    chat_id = chat.id
+
+    is_self = chat_id == owner_id
+    target_id = None if is_self else chat_id
+    target_name = "вашего аккаунта" if is_self else (
+        getattr(chat, "full_name", None) or chat.first_name or "собеседника"
+    )
+
+    try:
+        gifts = await fetch_all_gifts(conn_id, target_id)
+    except Exception as e:
+        logging.error(f"[GIFTS] Ошибка: {e}")
+        await try_delete_message(conn_id, message.message_id)
+        await notify_owner(
+            owner_id,
+            f"❌ Не удалось получить подарки: {e}\n\n"
+            "Нужна свежая версия aiogram (3.24+, Bot API 9.3). Если смотрите свой аккаунт — "
+            "у бота должно быть право на просмотр подарков в настройках Telegram Business."
+        )
+        return
+
+    nfts = [g for g in gifts if getattr(g, "type", None) == "unique"]
+    usd_rub, eur_rub, fresh = await fetch_fiat_rates()
+
+    if not nfts:
+        text = f"🎁 У {target_name} нет NFT-подарков (или они скрыты в профиле)."
+    else:
+        rows, total_usd, unpriced = [], 0.0, 0
+        for g in nfts:
+            ug = getattr(g, "gift", None)
+            name = getattr(ug, "name", None) or getattr(ug, "base_name", None) or "NFT"
+            number = getattr(ug, "number", None)
+            title = f"{getattr(ug, 'base_name', None) or name}" + (f" #{number}" if number else "")
+            price, source = nft_price_usd(g)
+            if price is None:
+                unpriced += 1
+                rows.append((0.0, f"• {title} — цена неизвестна"))
+            else:
+                total_usd += price
+                rows.append((price, f"• {title} — {format_usd(price, usd_rub, eur_rub)}" + (" (цена передачи)" if source == "передача" else "")))
+
+        rows.sort(key=lambda r: r[0], reverse=True)
+        shown = [r[1] for r in rows[:GIFTS_LIST_LIMIT]]
+        lines = [f"🖼 NFT-подарки {'вашего аккаунта' if is_self else 'пользователя ' + target_name}: {len(nfts)}", ""]
+        lines += shown
+        if len(rows) > GIFTS_LIST_LIMIT:
+            lines.append(f"…и ещё {len(rows) - GIFTS_LIST_LIMIT}")
+        lines += [
+            "",
+            f"💰 Итого: {format_usd(total_usd, usd_rub, eur_rub)}",
+            f"📈 Курс: 1 $ = {usd_rub:.2f} ₽, 1 € = {eur_rub:.2f} ₽" + ("" if fresh else " (запасной)"),
+        ]
+        if unpriced:
+            lines.append(f"⚠️ Без цены: {unpriced} (в итог не входят)")
+        lines.append("Оценка примерная: рыночная цена NFT может сильно отличаться.")
+        text = "\n".join(lines)[:4000]
+
+    if is_self:
+        await try_delete_message(conn_id, message.message_id)
+        await notify_owner(owner_id, text)
+        return
+
+    # Отчёт уходит в чат с собеседником: сообщение-команда превращается в результат
+    try:
+        await bot.edit_message_text(
+            text=text, business_connection_id=conn_id,
+            chat_id=chat_id, message_id=message.message_id,
+        )
+    except Exception as e:
+        logging.info(f"[GIFTS] Не удалось изменить сообщение ({e}), отправляю новое")
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, business_connection_id=conn_id)
+            await try_delete_message(conn_id, message.message_id)
+        except Exception as e2:
+            logging.error(f"[GIFTS] Не удалось отправить результат в чат: {e2}")
+            await notify_owner(owner_id, text)
+
+
 # ---------- Авто-форматирование: .bold .italic .monospace .underline ----------
 
 FORMAT_COMMANDS = {
@@ -1666,8 +1826,8 @@ async def send_neko(message: types.Message):
     await try_delete_message(conn_id, message.message_id)
 
 
-SPAM_MAX = 30
-SPAM_DELAY = 0.4
+SPAM_MAX = 250
+SPAM_DELAY = 0.3
 
 
 async def handle_spam_command(message: types.Message, owner_id: int, args: str):
@@ -1799,7 +1959,7 @@ async def handle_help_and_games(message: types.Message) -> bool:
         return True
 
     parts = text.split()
-    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".nsfw", ".duel", ".dice", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".love", ".gif", *FORMAT_COMMANDS):
+    if not parts or parts[0].lower() not in (".help", ".ttt", ".neko", ".nsfw", ".duel", ".dice", ".text", ".song", ".video", ".mute", ".unmute", ".spam", ".love", ".gif", ".gifts", *FORMAT_COMMANDS):
         return False
 
     owner_id = await ensure_connection_owner(conn_id)
@@ -1860,6 +2020,10 @@ async def handle_help_and_games(message: types.Message) -> bool:
 
     if command == ".gif":
         await handle_gif_command(message, owner_id)
+        return True
+
+    if command == ".gifts":
+        await handle_gifts_command(message, owner_id)
         return True
 
     if command == ".love":
@@ -2986,6 +3150,10 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("2.4", [
+        "🎁 Команда .gifts: цены NFT-подарков собеседника в рублях, долларах и евро прямо в чате",
+        "📨 Лимит .spam увеличен до 250, скорость — 0.3 сек между сообщениями",
+    ]),
     ("2.3", [
         "💖 Команда /donate: выберите сумму и поддержите бота звёздами",
     ]),
