@@ -2616,6 +2616,7 @@ async def cmd_all(message: types.Message):
 async def run_broadcast(ids: list, text: str, reply: types.Message | None, admin_chat: int):
     global BROADCAST_RUNNING
     ok = blocked = failed = 0
+    problems = []  # (id, причина) для отчёта
     try:
         for uid in ids:
             for _ in range(2):
@@ -2628,13 +2629,15 @@ async def run_broadcast(ids: list, text: str, reply: types.Message | None, admin
                     break
                 except TelegramRetryAfter as e:
                     await asyncio.sleep(e.retry_after + 1)
-                except TelegramForbiddenError:
-                    blocked += 1  # пользователь заблокировал бота
+                except TelegramForbiddenError as e:
+                    blocked += 1  # заблокировал бота или ни разу не нажимал /start
+                    problems.append((uid, str(e)[:80]))
                     await db_conn.execute("UPDATE bot_users SET blocked = 1 WHERE user_id = ?", (uid,))
                     break
                 except Exception as e:
                     logging.info(f"[РАССЫЛКА] {uid}: {e}")
                     failed += 1
+                    problems.append((uid, str(e)[:80]))
                     break
             else:
                 failed += 1  # дважды упёрлись в лимит
@@ -2642,10 +2645,10 @@ async def run_broadcast(ids: list, text: str, reply: types.Message | None, admin
         await db_conn.commit()
     finally:
         BROADCAST_RUNNING = False
-    await safe_send(
-        admin_chat,
-        f"✅ Рассылка завершена\nДоставлено: {ok}\nЗаблокировали бота: {blocked}\nОшибки: {failed}",
-    )
+    report = f"✅ Рассылка завершена\nДоставлено: {ok}\nНе доставлено (бот заблокирован или /start не нажат): {blocked}\nОшибки: {failed}"
+    if problems:
+        report += "\n\nКому не дошло:\n" + "\n".join(f"• {uid}: {reason}" for uid, reason in problems[:20])
+    await safe_send(admin_chat, report)
 
 
 # --- резервные копии: баланс и игры не пропадают, даже если хостинг стёр файл базы ---
