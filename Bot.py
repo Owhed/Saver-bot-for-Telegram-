@@ -3,14 +3,19 @@ import asyncio
 import aiosqlite
 import os
 import html
+import functools
+import hashlib
 import json
 import random
 import re
 import tempfile
 import time
 from aiogram import Bot, Dispatcher, types, F, Router
-from aiogram.types import BufferedInputFile, FSInputFile, LabeledPrice, PreCheckoutQuery
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import (
+    BufferedInputFile, FSInputFile, LabeledPrice, PreCheckoutQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiohttp
@@ -26,7 +31,9 @@ if not API_TOKEN:
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-DB_NAME = "messages_cache.db"
+# Путь к базе. На хостинге укажите путь на ПОСТОЯННОМ диске (например, DB_PATH=/data/messages_cache.db),
+# иначе при каждом обновлении файл базы (а с ним и баланс) стирается.
+DB_NAME = os.getenv("DB_PATH", "messages_cache.db")
 db_conn: aiosqlite.Connection | None = None
 
 # media_type -> (метод отправки, имя аргумента с файлом)
@@ -49,6 +56,7 @@ MAX_TEXT_LEN = 3000
 
 async def init_db():
     global db_conn
+    os.makedirs(os.path.dirname(os.path.abspath(DB_NAME)), exist_ok=True)
     db_conn = await aiosqlite.connect(DB_NAME)
 
     await db_conn.execute('''
@@ -147,12 +155,65 @@ async def init_db():
         )
     ''')
 
+    # Все, кто нажал /start (для рассылки от админа)
+    await db_conn.execute('''
+        CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            started INTEGER,
+            blocked INTEGER DEFAULT 0
+        )
+    ''')
+    # Подтягиваем уже известных пользователей (владельцы подключений и игроки)
+    await db_conn.execute(
+        "INSERT OR IGNORE INTO bot_users (user_id, name, started) "
+        "SELECT owner_user_id, '', strftime('%s','now') FROM connections WHERE owner_user_id IS NOT NULL"
+    )
+    await db_conn.execute(
+        "INSERT OR IGNORE INTO bot_users (user_id, name, started) "
+        "SELECT user_id, '', strftime('%s','now') FROM users"
+    )
+
     await db_conn.commit()
-    logging.info("База данных SQLite успешно запущена!")
+    logging.info(f"База данных SQLite успешно запущена: {DB_NAME}")
+
+
+async def register_user(user: types.User | None):
+    """Запоминаем всех, кто нажал /start, чтобы админ мог им писать (.all)."""
+    if not user or user.is_bot:
+        return
+    try:
+        await db_conn.execute(
+            "INSERT INTO bot_users (user_id, name, started, blocked) VALUES (?, ?, ?, 0) "
+            "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, blocked = 0",
+            (user.id, user.full_name, int(time.time())),
+        )
+        await db_conn.commit()
+    except Exception as e:
+        logging.error(f"Не удалось сохранить пользователя {user.id}: {e}")
+
+
+_SEEN_USERS: set = set()
+
+
+async def track_private_users(handler, event: types.Message, data: dict):
+    """Любой, кто написал боту в личку, попадает в список для рассылки."""
+    try:
+        if event.chat.type == "private" and event.from_user and event.from_user.id not in _SEEN_USERS:
+            await register_user(event.from_user)
+            _SEEN_USERS.add(event.from_user.id)
+    except Exception as e:
+        logging.error(f"[USERS] Не удалось запомнить пользователя: {e}")
+    return await handler(event, data)
+
+
+dp.message.outer_middleware(track_private_users)
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
+    await register_user(message.from_user)
+
     # Ссылка-приглашение в дуэль на звёзды: /start join_N
     if command.args and command.args.startswith("join_"):
         return await stars_join_from_start(message, command.args)
@@ -647,7 +708,7 @@ HELP_TEXT = (
     "⭐️ Команды в личке с ботом (дуэль на звёзды):\n\n"
     ".dicep ставка — создать дуэль на кубиках (по умолчанию 50 ⭐️)\n"
     ".bal — игровой баланс\n"
-    ".cancel — отменить свои игры без соперника\n"
+    ".cancel — отменить свои игры, которые ещё не начались (или .cancel N — игру №N); ставка вернётся на игровой баланс\n"
     ".withdraw — вывод (пока недоступен)"
 )
 
@@ -2093,6 +2154,7 @@ async def add_balance(user_id: int, amount: int):
         (user_id, amount),
     )
     await db_conn.commit()
+    request_backup()
 
 
 async def try_deduct(user_id: int, amount: int) -> bool:
@@ -2102,6 +2164,8 @@ async def try_deduct(user_id: int, amount: int) -> bool:
         (amount, user_id, amount),
     )
     await db_conn.commit()
+    if cur.rowcount > 0:
+        request_backup()
     return cur.rowcount > 0
 
 
@@ -2132,10 +2196,15 @@ async def invite_link(game_id: int) -> str:
 
 async def send_invite(chat_id: int, game_id: int):
     link = await invite_link(game_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отменить игру", callback_data=f"cancel_{game_id}")
+    ]])
     await bot.send_message(
         chat_id,
-        f"🎲 Игра #{game_id} активирована!\n\n🔗 <b>Ссылка для соперника:</b>\n<code>{link}</code>",
+        f"🎲 Игра #{game_id} активирована!\n\n🔗 <b>Ссылка для соперника:</b>\n<code>{link}</code>\n\n"
+        f"Передумали? Нажмите кнопку или напишите .cancel {game_id} — ставка вернётся на игровой баланс.",
         parse_mode="HTML",
+        reply_markup=kb,
     )
 
 
@@ -2179,25 +2248,80 @@ async def cmd_dicep(message: types.Message):
         )
 
 
-@stars_router.message(F.chat.type == "private", F.text == ".cancel")
-async def cmd_cancel(message: types.Message):
-    """Отмена своих игр, в которых ещё нет соперника; ставка возвращается на баланс."""
-    user_id = message.from_user.id
-    async with db_conn.execute(
-        "SELECT id, bet, status FROM stars_games "
-        "WHERE player1 = ? AND status IN ('ready_for_p2', 'waiting_p1_payment')", (user_id,)
-    ) as cur:
-        games = await cur.fetchall()
+async def cancel_game(game_id: int, user_id: int) -> str:
+    """Отменяет игру, которая ещё не началась. Ставка возвращается на игровой баланс."""
+    game = await get_game(game_id)
+    if not game:
+        return f"❌ Игра #{game_id} не найдена или уже завершена."
 
-    if not games:
-        return await message.answer("У вас нет игр, которые можно отменить.")
+    status = game["status"]
 
-    for game_id, bet, status in games:
+    # Создатель отменяет свою игру
+    if game["player1"] == user_id:
+        if status == "rolling":
+            return f"⏳ Игра #{game_id} уже идёт: кубики брошены, отменить нельзя."
         cur = await db_conn.execute("DELETE FROM stars_games WHERE id = ? AND status = ?", (game_id, status))
         await db_conn.commit()
-        if cur.rowcount and status == "ready_for_p2":
-            await add_balance(user_id, bet)
-    await message.answer("✅ Игры отменены, ставки возвращены на баланс.")
+        if not cur.rowcount:
+            return f"❌ Игра #{game_id} только что изменилась, попробуйте ещё раз."
+
+        if status == "waiting_p2_payment" and game["player2"]:
+            await safe_send(game["player2"], f"ℹ️ Игра #{game_id} отменена создателем.")
+        if status in ("ready_for_p2", "waiting_p2_payment"):
+            await add_balance(user_id, game["bet"])
+            return f"✅ Игра #{game_id} отменена: {game['bet']} ⭐️ возвращены на игровой баланс."
+        return f"✅ Игра #{game_id} отменена (оплата не поступала, ничего не списано)."
+
+    # Соперник выходит, пока не оплатил вход
+    if game["player2"] == user_id and status == "waiting_p2_payment":
+        cur = await db_conn.execute(
+            "UPDATE stars_games SET player2 = NULL, player2_name = NULL, status = 'ready_for_p2' "
+            "WHERE id = ? AND status = 'waiting_p2_payment' AND player2 = ?", (game_id, user_id)
+        )
+        await db_conn.commit()
+        if cur.rowcount:
+            return f"✅ Вы вышли из игры #{game_id}, ничего не списано."
+        return f"❌ Игра #{game_id} только что изменилась, попробуйте ещё раз."
+
+    return f"❌ Игра #{game_id} вам не принадлежит."
+
+
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.cancel(\s+\d+)?$"))
+async def cmd_cancel(message: types.Message):
+    """.cancel — отменить все свои ещё не начатые игры; .cancel N — только игру №N."""
+    user_id = message.from_user.id
+    parts = message.text.split()
+
+    if len(parts) > 1:
+        return await message.answer(await cancel_game(int(parts[1]), user_id))
+
+    async with db_conn.execute(
+        "SELECT id FROM stars_games WHERE "
+        "(player1 = ? AND status IN ('ready_for_p2', 'waiting_p1_payment', 'waiting_p2_payment')) "
+        "OR (player2 = ? AND status = 'waiting_p2_payment')",
+        (user_id, user_id),
+    ) as cur:
+        ids = [r[0] for r in await cur.fetchall()]
+
+    if not ids:
+        return await message.answer("У вас нет игр, которые можно отменить (начавшуюся игру отменить нельзя).")
+
+    results = []
+    for game_id in ids:
+        results.append(await cancel_game(game_id, user_id))
+    await message.answer("\n".join(results))
+
+
+@stars_router.callback_query(F.data.regexp(r"^cancel_\d+$"))
+async def cb_cancel(call: types.CallbackQuery):
+    game_id = int(call.data.split("_", 1)[1])
+    result = await cancel_game(game_id, call.from_user.id)
+    await call.answer(result[:200], show_alert=True)
+    if result.startswith("✅") and call.message:
+        try:
+            await call.message.edit_text(result, reply_markup=None)
+        except Exception as e:
+            logging.info(f"[STARS] Не удалось обновить сообщение после отмены: {e}")
 
 
 # --- присоединение соперника (вызывается из /start join_N) ---
@@ -2404,7 +2528,7 @@ async def stars_recover():
 
 # --- админка ---
 
-ADMIN_ID = 8478742975  # ваш Telegram ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8478742975"))  # ваш Telegram ID (узнать: напишите боту .id)
 
 
 @stars_router.message(
@@ -2425,6 +2549,243 @@ async def cmd_give(message: types.Message):
     await message.answer(f"✅ Баланс {target}: {await get_balance(target)} ⭐️")
 
 
+def admin_safe(func):
+    """Если админ-команда упала, показываем причину в чате, а не молчим."""
+    @functools.wraps(func)
+    async def wrapper(message: types.Message, **kwargs):
+        try:
+            return await func(message)
+        except Exception as e:
+            logging.exception(f"[ADMIN] Ошибка в {func.__name__}")
+            try:
+                await message.answer(f"❌ Ошибка в {func.__name__}: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+    return wrapper
+
+
+@stars_router.message(F.chat.type == "private", F.text == ".id")
+async def cmd_id(message: types.Message):
+    """Показывает ваш Telegram ID и совпадает ли он с ADMIN_ID в боте."""
+    uid = message.from_user.id
+    status = "✅ вы админ бота" if uid == ADMIN_ID else f"❌ вы НЕ админ (в боте указан ADMIN_ID={ADMIN_ID})"
+    await message.answer(f"Ваш ID: {uid}\n{status}")
+
+
+@stars_router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, F.text == ".users")
+@admin_safe
+async def cmd_users(message: types.Message):
+    async with db_conn.execute("SELECT COUNT(*), COALESCE(SUM(blocked), 0) FROM bot_users") as cur:
+        total, blocked = await cur.fetchone()
+    await message.answer(f"👥 В списке рассылки: {total}\n🚫 Заблокировали бота: {blocked}\n📬 Получат рассылку: {total - blocked}")
+
+
+# --- рассылка всем, кто нажал /start (только админ) ---
+
+BROADCAST_DELAY = 0.06  # ~16 сообщений в секунду, в пределах лимитов Telegram
+BROADCAST_RUNNING = False
+
+
+@stars_router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, F.text.regexp(r"^\.all(\s|$)"))
+@admin_safe
+async def cmd_all(message: types.Message):
+    """.all текст — разослать текст; ответом на сообщение (фото, видео и т.д.) — разослать его копию."""
+    global BROADCAST_RUNNING
+    text = message.text[4:].strip()
+    reply = message.reply_to_message
+    if not text and not reply:
+        return await message.answer(
+            "Формат: .all текст\nИли ответьте командой .all на любое сообщение, чтобы разослать его копию."
+        )
+    if BROADCAST_RUNNING:
+        return await message.answer("⏳ Предыдущая рассылка ещё идёт.")
+
+    async with db_conn.execute("SELECT user_id FROM bot_users WHERE blocked = 0") as cur:
+        ids = [r[0] for r in await cur.fetchall()]
+    if not ids:
+        return await message.answer(
+            "Пока некому писать: в списке никого нет. Люди попадают в него, когда пишут боту "
+            "(/start или любое сообщение) после этого обновления. Проверить: .users"
+        )
+
+    BROADCAST_RUNNING = True
+    await message.answer(f"📣 Рассылка началась: {len(ids)} получателей.")
+    spawn(run_broadcast(ids, text, reply, message.chat.id))
+
+
+async def run_broadcast(ids: list, text: str, reply: types.Message | None, admin_chat: int):
+    global BROADCAST_RUNNING
+    ok = blocked = failed = 0
+    try:
+        for uid in ids:
+            for _ in range(2):
+                try:
+                    if reply:
+                        await bot.copy_message(chat_id=uid, from_chat_id=reply.chat.id, message_id=reply.message_id)
+                    else:
+                        await bot.send_message(chat_id=uid, text=text, parse_mode=None)
+                    ok += 1
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except TelegramForbiddenError:
+                    blocked += 1  # пользователь заблокировал бота
+                    await db_conn.execute("UPDATE bot_users SET blocked = 1 WHERE user_id = ?", (uid,))
+                    break
+                except Exception as e:
+                    logging.info(f"[РАССЫЛКА] {uid}: {e}")
+                    failed += 1
+                    break
+            else:
+                failed += 1  # дважды упёрлись в лимит
+            await asyncio.sleep(BROADCAST_DELAY)
+        await db_conn.commit()
+    finally:
+        BROADCAST_RUNNING = False
+    await safe_send(
+        admin_chat,
+        f"✅ Рассылка завершена\nДоставлено: {ok}\nЗаблокировали бота: {blocked}\nОшибки: {failed}",
+    )
+
+
+# --- резервные копии: баланс и игры не пропадают, даже если хостинг стёр файл базы ---
+
+BACKUP_TABLES = ["users", "bot_users", "connections", "stars_games", "style_modes", "formats", "muted_chats", "duels"]
+BACKUP_INTERVAL = 3 * 3600   # регулярная копия раз в 3 часа (если что-то изменилось)
+BACKUP_DEBOUNCE = 20         # и через 20 секунд после любого движения звёзд
+_last_backup_hash: str | None = None
+_backup_pending = False
+
+
+async def build_backup() -> dict:
+    data = {}
+    for table in BACKUP_TABLES:
+        async with db_conn.execute(f"SELECT * FROM {table}") as cur:
+            cols = [c[0] for c in cur.description]
+            rows = await cur.fetchall()
+        data[table] = {"columns": cols, "rows": [list(r) for r in rows]}
+    return data
+
+
+async def send_backup(force: bool = False) -> bool:
+    """Отправляет админу файл с копией данных. Без force — только если есть данные и они изменились."""
+    global _last_backup_hash
+    if db_conn is None:
+        return False
+    data = await build_backup()
+    if not force and not (data["users"]["rows"] or data["bot_users"]["rows"]):
+        return False  # база пустая (возможно, её только что стёрло) — не затираем хорошую копию
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    if not force and digest == _last_backup_hash:
+        return False
+    _last_backup_hash = digest
+    await bot.send_document(
+        ADMIN_ID,
+        BufferedInputFile(payload, filename=f"backup_{time.strftime('%Y%m%d_%H%M%S')}.json"),
+        caption="💾 Резервная копия. Если баланс пропал: ответьте на этот файл командой .restore",
+        disable_notification=True,
+    )
+    return True
+
+
+def request_backup():
+    """Копия через несколько минут после движения звёзд (несколько изменений подряд — одна копия)."""
+    global _backup_pending
+    if _backup_pending:
+        return
+    _backup_pending = True
+
+    async def job():
+        global _backup_pending
+        await asyncio.sleep(BACKUP_DEBOUNCE)
+        _backup_pending = False
+        try:
+            await send_backup()
+        except Exception as e:
+            logging.error(f"[BACKUP] Не удалось отправить копию: {e}")
+
+    spawn(job())
+
+
+async def startup_backup():
+    await asyncio.sleep(15)  # даём боту подняться
+    try:
+        await send_backup()
+    except Exception as e:
+        logging.error(f"[BACKUP] Копия при запуске не отправлена: {e}")
+
+
+async def backup_loop():
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL)
+        try:
+            await send_backup()
+        except Exception as e:
+            logging.error(f"[BACKUP] Не удалось отправить копию: {e}")
+
+
+async def restore_backup(data: dict) -> str:
+    report = []
+    for table in BACKUP_TABLES:
+        block = data.get(table)
+        if not isinstance(block, dict) or not block.get("rows"):
+            continue
+        cols = block["columns"]
+        async with db_conn.execute(f"PRAGMA table_info({table})") as cur:
+            valid = {r[1] for r in await cur.fetchall()}
+        if not set(cols) <= valid:
+            report.append(f"{table}: пропущено (не совпадают поля)")
+            continue
+        query = f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})"
+        await db_conn.executemany(query, block["rows"])
+        report.append(f"{table}: {len(block['rows'])}")
+    await db_conn.commit()
+    STYLE_MODE_CACHE.clear()
+    FORMAT_CACHE.clear()
+    await stars_recover()  # приводим игры в порядок (зависшие ставки вернутся на баланс)
+    return "\n".join(report) or "в копии нет данных"
+
+
+async def restore_from_doc(message: types.Message, doc: types.Document):
+    try:
+        tg_file = await bot.get_file(doc.file_id)
+        raw = (await bot.download_file(tg_file.file_path)).read()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("неверный формат файла")
+        report = await restore_backup(data)
+    except Exception as e:
+        return await message.answer(f"❌ Не удалось восстановить: {e}")
+    await message.answer("✅ Данные восстановлены:\n" + report)
+
+
+@stars_router.message(
+    F.chat.type == "private", F.from_user.id == ADMIN_ID, F.text == ".restore", F.reply_to_message.document
+)
+@admin_safe
+async def cmd_restore_reply(message: types.Message):
+    await restore_from_doc(message, message.reply_to_message.document)
+
+
+@stars_router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, F.document, F.caption == ".restore")
+@admin_safe
+async def cmd_restore_caption(message: types.Message):
+    await restore_from_doc(message, message.document)
+
+
+@stars_router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, F.text == ".restore")
+async def cmd_restore_help(message: types.Message):
+    await message.answer("Ответьте командой .restore на файл резервной копии (backup_....json) или отправьте файл с подписью .restore")
+
+
+@stars_router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, F.text == ".backup")
+@admin_safe
+async def cmd_backup(message: types.Message):
+    await send_backup(force=True)
+    await message.answer("✅ Копия отправлена (файл выше).")
+
+
 dp.include_router(stars_router)
 
 
@@ -2434,6 +2795,10 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("2.1", [
+        "❌ Игру на звёзды можно отменить: кнопкой под ссылкой или командой .cancel (.cancel N), ставка вернётся на игровой баланс",
+        "💾 Баланс звёзд больше не пропадает при обновлении бота",
+    ]),
     ("2.0", [
         "🔪 Новый режим .yandere — включается и выключается как .tsundere и .kawaii",
         "🎭 Добавлено больше фраз для .tsundere и .kawaii",
@@ -2535,6 +2900,8 @@ async def main():
     await init_db()
     await stars_recover()  # вернуть ставки из игр, прерванных перезапуском
     runner = await start_web_server()
+    spawn(backup_loop())
+    spawn(startup_backup())
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -2550,6 +2917,10 @@ async def main():
             close_bot_session=False,  # сессию закроем сами, после уведомления об остановке
         )
     finally:
+        try:
+            await send_backup()  # последняя копия перед остановкой
+        except Exception as e:
+            logging.info(f"[BACKUP] Копия при остановке не отправлена: {e}")
         await runner.cleanup()
         if db_conn:
             await db_conn.close()
