@@ -213,7 +213,7 @@ async def init_db():
     await ensure_columns("users", {"balance": "INTEGER DEFAULT 0"})
     await ensure_columns("stars_games", {
         "player1": "INTEGER", "player1_name": "TEXT", "player2": "INTEGER", "player2_name": "TEXT",
-        "bet": "INTEGER", "status": "TEXT", "created": "INTEGER",
+        "bet": "INTEGER", "status": "TEXT", "created": "INTEGER", "kind": "TEXT DEFAULT 'dice'",
     })
     await ensure_columns("withdrawals", {
         "user_id": "INTEGER", "name": "TEXT", "username": "TEXT", "amount": "INTEGER",
@@ -834,6 +834,7 @@ HELP_TEXT = (
     ".help — этот список\n\n"
     "⭐️ Команды в личке с ботом (дуэль на звёзды):\n\n"
     ".dicep ставка — создать дуэль на кубиках (по умолчанию 50 ⭐️)\n"
+    ".fut ставка — создать дуэль на пенальти (по умолчанию 50 ⭐️): бьют по очереди до гола, побеждает тот, кто забил с меньшего числа попыток\n"
     ".bal — игровой баланс\n"
     ".cancel — отменить свои игры, которые ещё не начались (или .cancel N — игру №N); ставка вернётся на игровой баланс\n"
     ".withdraw — вывод от 50 ⭐️ (заявка уходит админу); .withdraw сумма — вывести часть\n"
@@ -2694,7 +2695,7 @@ async def try_deduct(user_id: int, amount: int) -> bool:
 
 # --- игры хранятся в БД (а не в памяти), чтобы ставки не терялись при перезапуске ---
 
-GAME_COLS = "id, player1, player1_name, player2, player2_name, bet, status"
+GAME_COLS = "id, player1, player1_name, player2, player2_name, bet, status, kind"
 
 
 async def get_game(game_id: int) -> dict | None:
@@ -2703,10 +2704,10 @@ async def get_game(game_id: int) -> dict | None:
     return dict(zip(GAME_COLS.split(", "), row)) if row else None
 
 
-async def create_game(user_id: int, name: str, bet: int, status: str) -> int:
+async def create_game(user_id: int, name: str, bet: int, status: str, kind: str = "dice") -> int:
     cur = await db_conn.execute(
-        "INSERT INTO stars_games (player1, player1_name, bet, status, created) VALUES (?, ?, ?, ?, ?)",
-        (user_id, name, bet, status, int(time.time())),
+        "INSERT INTO stars_games (player1, player1_name, bet, status, created, kind) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, name, bet, status, int(time.time()), kind),
     )
     await db_conn.commit()
     return cur.lastrowid
@@ -2717,14 +2718,19 @@ async def invite_link(game_id: int) -> str:
     return f"https://t.me/{me.username}?start=join_{game_id}"
 
 
+KIND_INFO = {"dice": ("🎲", "Дуэль на кубиках"), "fut": ("⚽", "Пенальти на звёзды")}
+
+
 async def send_invite(chat_id: int, game_id: int):
     link = await invite_link(game_id)
+    game = await get_game(game_id)
+    icon, title = KIND_INFO.get((game or {}).get("kind") or "dice", KIND_INFO["dice"])
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="❌ Отменить игру", callback_data=f"cancel_{game_id}")
     ]])
     await bot.send_message(
         chat_id,
-        f"🎲 Игра #{game_id} активирована!\n\n🔗 <b>Ссылка для соперника:</b>\n<code>{link}</code>\n\n"
+        f"{icon} {title} #{game_id} активирована!\n\n🔗 <b>Ссылка для соперника:</b>\n<code>{link}</code>\n\n"
         f"Передумали? Нажмите кнопку или напишите .cancel {game_id} — ставка вернётся на игровой баланс.",
         parse_mode="HTML",
         reply_markup=kb,
@@ -2768,14 +2774,17 @@ def user_safe(func):
     return wrapper
 
 
-@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.dicep(\s|$)"))
-@user_safe
-async def cmd_dicep(message: types.Message):
-    """.dicep [ставка] — создать дуэль на кубиках. Ставка списывается с игрового баланса, а если его не хватает — выставляется счёт."""
+FUT_MAX_ATTEMPTS = 15       # страховка от бесконечного цикла
+FUT_ANIMATION_DELAY = 4.0   # столько идёт анимация мяча в Telegram
+
+
+async def open_duel(message: types.Message, kind: str, cmd: str):
+    """Создание дуэли на звёзды (.dicep — кубики, .fut — пенальти). Ставка списывается с игрового баланса, а если его не хватает — выставляется счёт."""
+    icon, title = KIND_INFO[kind]
     user = message.from_user
     parts = message.text.split()
     if len(parts) > 2 or (len(parts) == 2 and not parts[1].isdigit()):
-        return await message.answer(f"Формат: .dicep ставка (например, .dicep 50). Ставка от {STARS_MIN_BET} до {STARS_MAX_BET} ⭐️.")
+        return await message.answer(f"Формат: {cmd} ставка (например, {cmd} 50). Ставка от {STARS_MIN_BET} до {STARS_MAX_BET} ⭐️.")
     bet = int(parts[1]) if len(parts) == 2 else DICEP_DEFAULT_BET
     if not STARS_MIN_BET <= bet <= STARS_MAX_BET:
         return await message.answer(f"❌ Ставка должна быть от {STARS_MIN_BET} до {STARS_MAX_BET} ⭐️.")
@@ -2790,7 +2799,7 @@ async def cmd_dicep(message: types.Message):
     # Хватает игрового баланса — ставка списывается сразу
     if await try_deduct(user.id, bet):
         try:
-            game_id = await create_game(user.id, user.full_name, bet, "ready_for_p2")
+            game_id = await create_game(user.id, user.full_name, bet, "ready_for_p2", kind)
         except Exception as e:
             await add_balance(user.id, bet)  # не потеряем ставку, если игру создать не вышло
             logging.error(f"[STARS] Не удалось создать игру: {e}")
@@ -2806,11 +2815,11 @@ async def cmd_dicep(message: types.Message):
             )
 
     # Баланса не хватает — счёт на оплату ставки
-    game_id = await create_game(user.id, user.full_name, bet, "waiting_p1_payment")
+    game_id = await create_game(user.id, user.full_name, bet, "waiting_p1_payment", kind)
     try:
         await bot.send_invoice(
             chat_id=message.chat.id,
-            title=f"Дуэль на кубиках #{game_id}",
+            title=f"{title} #{game_id}",
             description=f"Ставка {bet} ⭐️. После оплаты вы получите ссылку для соперника.",
             payload=f"p1_pay_{game_id}",
             currency="XTR",
@@ -2822,6 +2831,20 @@ async def cmd_dicep(message: types.Message):
         logging.error(f"[STARS] Не удалось выставить счёт: {e}")
         return await message.answer(f"❌ Не удалось выставить счёт: {e}")
     spawn(p1_payment_timeout(game_id))
+
+
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.dicep(\s|$)"))
+@user_safe
+async def cmd_dicep(message: types.Message):
+    """.dicep [ставка] — дуэль на кубиках."""
+    await open_duel(message, "dice", ".dicep")
+
+
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.fut(\s|$)"))
+@user_safe
+async def cmd_fut(message: types.Message):
+    """.fut [ставка] — дуэль на пенальти: бьёт до гола, побеждает тот, кто забил с меньшего числа попыток."""
+    await open_duel(message, "fut", ".fut")
 
 
 async def cancel_game(game_id: int, user_id: int) -> str:
@@ -3234,15 +3257,36 @@ async def safe_send(chat_id: int, text: str):
         logging.info(f"[STARS] Не удалось написать {chat_id}: {e}")
 
 
+async def roll_fut(roller: int, watcher: int) -> int:
+    """Бьёт мячом, пока не забьёт. Возвращает число попыток (FUT_MAX_ATTEMPTS + 1, если гола так и не было)."""
+    await bot.send_message(roller, "⚽ Ваш удар...")
+    for n in range(1, FUT_MAX_ATTEMPTS + 1):
+        d = await bot.send_dice(chat_id=roller, emoji="⚽")
+        try:
+            await bot.forward_message(chat_id=watcher, from_chat_id=roller, message_id=d.message_id)
+        except Exception as e:
+            logging.info(f"[STARS] Не удалось показать удар сопернику: {e}")
+        await asyncio.sleep(FUT_ANIMATION_DELAY)  # даём анимации закончиться, чтобы не спойлерить
+        if d.dice.value >= 3:  # 3, 4, 5 — гол; 1, 2 — мимо
+            await safe_send(roller, f"⚽ ГОЛ! С {n}-й попытки")
+            await safe_send(watcher, f"⚽ Соперник забил с {n}-й попытки")
+            return n
+    await safe_send(roller, f"❌ Гола нет за {FUT_MAX_ATTEMPTS} попыток")
+    await safe_send(watcher, f"❌ Соперник не забил за {FUT_MAX_ATTEMPTS} попыток")
+    return FUT_MAX_ATTEMPTS + 1
+
+
 async def run_game_logic(game_id: int):
     game = await get_game(game_id)
     if not game or game["status"] != "rolling":
         return
     p1, p2, bet = game["player1"], game["player2"], game["bet"]
 
+    kind = game.get("kind") or "dice"
+    roller = roll_fut if kind == "fut" else roll_pair
     try:
-        s1 = await roll_pair(p1, p2)
-        s2 = await roll_pair(p2, p1)
+        s1 = await roller(p1, p2)
+        s2 = await roller(p2, p1)
     except Exception as e:
         # Сбой до результата — возвращаем обе ставки
         logging.error(f"[STARS] Игра {game_id} прервана: {e}")
@@ -3264,19 +3308,26 @@ async def run_game_logic(game_id: int):
     total_bank = bet * 2
     prize = total_bank - int(total_bank * STARS_COMMISSION)
 
-    if s1 > s2:
+    if kind == "fut":
+        diff = s2 - s1  # в пенальти меньше попыток — лучше
+        label = lambda x: f"{x} поп." if x <= FUT_MAX_ATTEMPTS else "без гола"
+    else:
+        diff = s1 - s2
+        label = str
+
+    if diff > 0:
         await add_balance(p1, prize)
-        await safe_send(p1, f"🏆 Вы выиграли {prize} ⭐️ ({s1} vs {s2})")
-        await safe_send(p2, f"📉 Вы проиграли ({s2} vs {s1})")
-    elif s2 > s1:
+        await safe_send(p1, f"🏆 Вы выиграли {prize} ⭐️ ({label(s1)} vs {label(s2)})")
+        await safe_send(p2, f"📉 Вы проиграли ({label(s2)} vs {label(s1)})")
+    elif diff < 0:
         await add_balance(p2, prize)
-        await safe_send(p2, f"🏆 Вы выиграли {prize} ⭐️ ({s2} vs {s1})")
-        await safe_send(p1, f"📉 Вы проиграли ({s1} vs {s2})")
+        await safe_send(p2, f"🏆 Вы выиграли {prize} ⭐️ ({label(s2)} vs {label(s1)})")
+        await safe_send(p1, f"📉 Вы проиграли ({label(s1)} vs {label(s2)})")
     else:
         await add_balance(p1, bet)
         await add_balance(p2, bet)
-        await safe_send(p1, f"🤝 Ничья ({s1}={s2}). Ставка возвращена.")
-        await safe_send(p2, f"🤝 Ничья ({s2}={s1}). Ставка возвращена.")
+        await safe_send(p1, f"🤝 Ничья ({label(s1)}={label(s2)}). Ставка возвращена.")
+        await safe_send(p2, f"🤝 Ничья ({label(s2)}={label(s1)}). Ставка возвращена.")
 
 
 async def stars_recover():
@@ -3736,6 +3787,9 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("2.9", [
+        "⚽ Новая команда .fut в личке с ботом: дуэль на пенальти на звёзды — бьёте до гола, побеждает тот, кто забил с меньшего числа попыток",
+    ]),
     ("2.8", [
         "🎲 .dicep: исправлена работа со старой базой данных, а при сбое бот теперь пишет причину ошибки",
     ]),
