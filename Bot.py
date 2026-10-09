@@ -1500,17 +1500,20 @@ async def run_dice(message: types.Message):
         DICE_RUNNING.discard(key)
 
 
-# ---------- Оценка подарков (.gifts) ----------
+# ---------- Оценка NFT-подарков (.gifts) ----------
 
 STAR_USD_BUY = float(os.getenv("STAR_USD_BUY", "0.02"))  # цена 1 ⭐️ в $ (для цены передачи NFT)
 FALLBACK_USD_RUB = float(os.getenv("USD_RUB", "80"))
 FALLBACK_EUR_RUB = float(os.getenv("EUR_RUB", "92"))
-GIFTS_LIST_LIMIT = 25  # сколько NFT показывать списком (остальные — в итоге)
+TON_USD_FALLBACK = float(os.getenv("TON_USD", "0"))   # запасной курс TON, если биржи недоступны
+GIFTS_LIST_LIMIT = 25     # сколько NFT показывать списком (остальные — в итоге)
+PRICE_LOOKUP_MAX = 40     # максимум разных запросов цен за одну команду
+PRICE_TTL_OK = 600        # успешные цены кэшируем на 10 минут
+PRICE_TTL_FAIL = 60       # неудачные — на минуту
 
 
 def load_gift_floors() -> dict[str, float]:
-    """Флор-цены коллекций в $: GIFT_FLOORS='{"Plush Pepe": 3000, "Durov's Cap": 1200}'.
-    Bot API не отдаёт рыночную цену NFT, поэтому её можно задать вручную."""
+    """Ручные флор-цены в $: GIFT_FLOORS='{"Plush Pepe": 3000}' (используются, если рынок не ответил)."""
     try:
         raw = json.loads(os.getenv("GIFT_FLOORS", "") or "{}")
         return {str(k).strip().lower(): float(v) for k, v in raw.items()}
@@ -1520,7 +1523,52 @@ def load_gift_floors() -> dict[str, float]:
 
 
 GIFT_FLOORS = load_gift_floors()
+_PRICE_ERRORS: list[str] = []   # причины неудач последнего запроса цен (для диагностики владельцу)
 
+
+# --- Telegram Bot API напрямую: не зависит от версии aiogram и названий полей в его моделях ---
+
+async def tg_api(method: str, params: dict) -> dict | list:
+    url = f"https://api.telegram.org/bot{API_TOKEN}/{method}"
+    timeout = aiohttp.ClientTimeout(total=25)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=params) as resp:
+            data = await resp.json(content_type=None)
+    if not isinstance(data, dict) or not data.get("ok"):
+        desc = data.get("description") if isinstance(data, dict) else str(data)[:200]
+        raise RuntimeError(f"{method}: {desc}")
+    return data["result"]
+
+
+async def fetch_all_gifts(conn_id: str, user_id: int | None = None) -> list[dict]:
+    """Подарки собеседника (getUserGifts) или, если user_id нет, подарки аккаунта владельца."""
+    gifts: list[dict] = []
+    offset = None
+    for _ in range(50):  # защита от бесконечного цикла
+        if user_id is not None:
+            params = {"user_id": user_id, "limit": 100}
+            method = "getUserGifts"
+        else:
+            params = {"business_connection_id": conn_id, "limit": 100}
+            method = "getBusinessAccountGifts"
+        if offset:
+            params["offset"] = offset
+        page = await tg_api(method, params)
+        gifts.extend(page.get("gifts") or [])
+        offset = page.get("next_offset")
+        if not offset:
+            break
+    return gifts
+
+
+def nft_fields(g: dict) -> tuple[str, str | None, int | None]:
+    ug = g.get("gift") or {}
+    base = ug.get("base_name") or ""
+    model = (ug.get("model") or {}).get("name")
+    return base, model, ug.get("number")
+
+
+# --- курсы валют ---
 
 async def fetch_fiat_rates() -> tuple[float, float, bool]:
     """Курсы ЦБ РФ: (RUB за 1 USD, RUB за 1 EUR, получены ли актуальные)."""
@@ -1536,25 +1584,41 @@ async def fetch_fiat_rates() -> tuple[float, float, bool]:
         eur = v["EUR"]["Value"] / v["EUR"]["Nominal"]
         return usd, eur, True
     except Exception as e:
-        logging.warning(f"[GIFTS] Не удалось получить курсы: {e}")
+        logging.warning(f"[GIFTS] Не удалось получить курсы ЦБ: {e}")
         return FALLBACK_USD_RUB, FALLBACK_EUR_RUB, False
 
 
-async def fetch_all_gifts(conn_id: str, user_id: int | None = None) -> list:
-    """Подарки собеседника (user_id) через getUserGifts; без user_id — подарки самого аккаунта владельца."""
-    gifts, offset = [], None
-    for _ in range(50):  # защита от бесконечного цикла
-        if user_id is not None:
-            page = await bot.get_user_gifts(user_id=user_id, offset=offset, limit=100)
-        else:
-            page = await bot.get_business_account_gifts(
-                business_connection_id=conn_id, offset=offset, limit=100
-            )
-        gifts.extend(page.gifts)
-        offset = page.next_offset
-        if not offset:
-            break
-    return gifts
+_TON_RATE: dict = {"ts": 0.0, "usd": None}
+
+TON_RATE_SOURCES = [
+    ("https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd",
+     lambda d: d["the-open-network"]["usd"]),
+    ("https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT", lambda d: d["price"]),
+    ("https://www.okx.com/api/v5/market/ticker?instId=TON-USDT", lambda d: d["data"][0]["last"]),
+]
+
+
+async def fetch_ton_usd() -> float | None:
+    """Курс TON в $: несколько бирж по очереди, затем TON_USD из окружения."""
+    if _TON_RATE["usd"] and time.time() - _TON_RATE["ts"] < PRICE_TTL_OK:
+        return _TON_RATE["usd"]
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url, extract in TON_RATE_SOURCES:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    data = await resp.json(content_type=None)
+                rate = float(extract(data))
+                if rate > 0:
+                    _TON_RATE.update(ts=time.time(), usd=rate)
+                    return rate
+            except Exception as e:
+                logging.warning(f"[GIFTS] Курс TON ({url.split('/')[2]}): {e}")
+    if not _TON_RATE["usd"] and not TON_USD_FALLBACK:
+        _PRICE_ERRORS.append("не удалось получить курс TON (CoinGecko/Binance/OKX недоступны)")
+    return _TON_RATE["usd"] or (TON_USD_FALLBACK or None)
 
 
 def format_usd(usd: float, usd_rub: float, eur_rub: float) -> str:
@@ -1563,96 +1627,130 @@ def format_usd(usd: float, usd_rub: float, eur_rub: float) -> str:
     return f"{rub:,.0f} ₽ | ${usd:,.2f} | €{eur:,.2f}".replace(",", " ")
 
 
-# --- цены NFT-подарков: флор с Tonnel (неофициальный API, через библиотеку tonnelmp) ---
-TONNEL_ENABLED = os.getenv("TONNEL_ENABLED", "1") != "0"
-TON_USD_FALLBACK = float(os.getenv("TON_USD", "0"))   # запасной курс TON, если CoinGecko недоступен
-PRICE_TTL = 600                                      # кэш цен на 10 минут
-PRICE_LOOKUP_MAX = 40                                # максимум разных запросов за одну команду
-_FLOOR_CACHE: dict[tuple, tuple[float, float | None]] = {}
-_TON_RATE: dict = {"ts": 0.0, "usd": None}
+# --- флор-цены NFT: библиотека TelegramGifts (без ключей и авторизации) ---
+# pip install TelegramGifts — отдаёт цены TGMrkt / GetGems / Fragment из открытого набора данных.
+
+_gifts_lib = None
+_FLOOR_CACHE: dict[tuple, tuple[float, float | None, str]] = {}
 _floor_sem: asyncio.Semaphore | None = None
 
 
-async def fetch_ton_usd() -> float | None:
-    """Курс TON в $ (CoinGecko, без ключа)."""
-    if _TON_RATE["usd"] and time.time() - _TON_RATE["ts"] < PRICE_TTL:
-        return _TON_RATE["usd"]
-    timeout = aiohttp.ClientTimeout(total=8)
+def _get_gifts_lib():
+    global _gifts_lib
+    if _gifts_lib is None:
+        from TelegramGifts import TelegramGifts
+        try:
+            _gifts_lib = TelegramGifts(cache_mode="http", asset_mode="lazy")  # без git-клонирования
+        except TypeError:
+            _gifts_lib = TelegramGifts()
+    return _gifts_lib
+
+
+def _positive(x) -> float | None:
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": "the-open-network", "vs_currencies": "usd"},
-            ) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"HTTP {resp.status}")
-                data = await resp.json(content_type=None)
-        rate = float(data["the-open-network"]["usd"])
-        _TON_RATE.update(ts=time.time(), usd=rate)
-        return rate
+        v = float(x)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _slug_candidates(name: str) -> list[str]:
+    """'Plush Pepe' -> 'plush_pepe'; варианты написания ключа для библиотеки."""
+    n = name.strip()
+    low = n.lower()
+    cands = [n]
+    for c in (
+        re.sub(r"[^a-z0-9]+", "_", low.replace("'", "").replace("’", "")).strip("_"),
+        re.sub(r"[^a-z0-9]+", "_", low).strip("_"),
+    ):
+        if c and c not in cands:
+            cands.append(c)
+    return cands
+
+
+def _get(obj, key):
+    return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
+def _lib_model_price_sync(name: str, model: str) -> float | None:
+    lib = _get_gifts_lib()
+    for key in _slug_candidates(name):
+        try:
+            m = lib.get_model_details(key, model)
+        except Exception:
+            continue
+        price = _positive(_get(m, "price_ton")) if m else None
+        if price:
+            return price
+    return None
+
+
+def _lib_collection_price_sync(name: str) -> float | None:
+    lib = _get_gifts_lib()
+    for key in _slug_candidates(name):
+        try:
+            info = lib.get_gift(key)
+        except Exception:
+            continue
+        prices = _get(info, "prices") if info else None
+        if not isinstance(prices, dict):
+            continue
+        vals = [
+            _positive(v) for k, v in prices.items()
+            if "price" in str(k).lower() and "ton" in str(k).lower()
+        ]
+        vals = [v for v in vals if v]
+        if vals:
+            return min(vals)
+    return None
+
+
+async def _run_blocking(fn, *args):
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=40)
+    except ImportError:
+        _PRICE_ERRORS.append("не установлена библиотека TelegramGifts (pip install TelegramGifts)")
     except Exception as e:
-        logging.warning(f"[GIFTS] Не удалось получить курс TON: {e}")
-        return _TON_RATE["usd"] or (TON_USD_FALLBACK or None)
+        _PRICE_ERRORS.append(f"{fn.__name__}: {type(e).__name__}: {str(e)[:120]}")
+        logging.warning(f"[GIFTS] {fn.__name__}({args}) не удалось: {e}")
+    return None
 
 
-def _tonnel_floor_sync(name: str, model: str | None) -> float | None:
-    from tonnelmp import getGifts  # pip install tonnelmp
-    kwargs = {"gift_name": name, "limit": 1, "sort": "price_asc"}
-    if model:
-        kwargs["model"] = model
-    items = getGifts(**kwargs)
-    if not items:
-        return None
-    it = items[0]
-    price = it.get("price") if isinstance(it, dict) else getattr(it, "price", None)
-    return float(price) if price else None
-
-
-async def tonnel_floor_ton(name: str, model: str | None) -> float | None:
-    """Минимальная цена на Tonnel в TON (для модели или всей коллекции), с кэшем."""
+async def market_floor_ton(name: str, model: str | None) -> tuple[float | None, str]:
+    """Флор в TON и пояснение: сначала по модели, затем по всей коллекции. Результат кэшируется."""
     global _floor_sem
-    if not TONNEL_ENABLED or not name:
-        return None
+    if not name:
+        return None, ""
     key = (name.lower(), (model or "").lower())
     cached = _FLOOR_CACHE.get(key)
-    if cached and time.time() - cached[0] < PRICE_TTL:
-        return cached[1]
+    if cached:
+        ttl = PRICE_TTL_OK if cached[1] else PRICE_TTL_FAIL
+        if time.time() - cached[0] < ttl:
+            return cached[1], cached[2]
     if _floor_sem is None:
-        _floor_sem = asyncio.Semaphore(3)
+        _floor_sem = asyncio.Semaphore(4)
+    price, label = None, ""
     async with _floor_sem:
-        try:
-            price = await asyncio.wait_for(asyncio.to_thread(_tonnel_floor_sync, name, model), timeout=20)
-        except ImportError:
-            logging.warning("[GIFTS] Не установлена библиотека tonnelmp: добавьте tonnelmp в requirements.txt")
-            return None
-        except Exception as e:
-            logging.warning(f"[GIFTS] Tonnel не ответил для {name}/{model}: {e}")
-            return None
-    _FLOOR_CACHE[key] = (time.time(), price)
-    return price
-
-
-def _nft_names(g) -> tuple[str, str | None]:
-    ug = getattr(g, "gift", None)
-    base = getattr(ug, "base_name", None) or ""
-    model = getattr(getattr(ug, "model", None), "name", None)
-    return base, model
-
-
-async def nft_price_usd(g, ton_usd: float | None) -> tuple[float | None, str]:
-    """Цена NFT в $ и источник: Tonnel (модель → коллекция), затем GIFT_FLOORS, затем цена передачи."""
-    base, model = _nft_names(g)
-    if ton_usd and base:
         if model:
-            ton = await tonnel_floor_ton(base, model)
-            if ton:
-                return ton * ton_usd, "флор модели, Tonnel"
-        ton = await tonnel_floor_ton(base, None)
+            price = await _run_blocking(_lib_model_price_sync, name, model)
+            label = "флор модели"
+        if not price:
+            price = await _run_blocking(_lib_collection_price_sync, name)
+            label = "флор коллекции"
+    _FLOOR_CACHE[key] = (time.time(), price, label if price else "")
+    return price, (label if price else "")
+
+
+async def nft_price_usd(g: dict, ton_usd: float | None) -> tuple[float | None, str]:
+    """Цена NFT в $ и источник: рынок (модель → коллекция), затем GIFT_FLOORS, затем цена передачи."""
+    base, model, _ = nft_fields(g)
+    if ton_usd and base:
+        ton, label = await market_floor_ton(base, model)
         if ton:
-            return ton * ton_usd, "флор коллекции, Tonnel"
+            return ton * ton_usd, label
     if base and base.strip().lower() in GIFT_FLOORS:
         return GIFT_FLOORS[base.strip().lower()], "флор, вручную"
-    ts = getattr(g, "transfer_star_count", None)
+    ts = g.get("transfer_star_count")
     if ts:
         return ts * STAR_USD_BUY, "цена передачи"
     return None, ""
@@ -1671,66 +1769,78 @@ async def handle_gifts_command(message: types.Message, owner_id: int):
     target_name = "вашего аккаунта" if is_self else (
         getattr(chat, "full_name", None) or chat.first_name or "собеседника"
     )
+    _PRICE_ERRORS.clear()
 
     try:
         gifts = await fetch_all_gifts(conn_id, target_id)
     except Exception as e:
         logging.error(f"[GIFTS] Ошибка: {e}")
         await try_delete_message(conn_id, message.message_id)
-        await notify_owner(
-            owner_id,
-            f"❌ Не удалось получить подарки: {e}\n\n"
-            "Нужна свежая версия aiogram (3.24+, Bot API 9.3). Если смотрите свой аккаунт — "
-            "у бота должно быть право на просмотр подарков в настройках Telegram Business."
+        hint = (
+            "У бота должно быть право на просмотр подарков в Настройки → Telegram Business → Чат-боты."
+            if is_self else
+            "Метод getUserGifts доступен в Bot API 9.3+. Если ошибка про права или пользователя — "
+            "собеседник мог скрыть подарки или не писал боту."
         )
+        await notify_owner(owner_id, f"❌ Не удалось получить подарки: {e}\n\n{hint}")
         return
 
-    nfts = [g for g in gifts if getattr(g, "type", None) == "unique"]
+    nfts = [g for g in gifts if g.get("type") == "unique"]
+    regular_count = len(gifts) - len(nfts)
     usd_rub, eur_rub, fresh = await fetch_fiat_rates()
     ton_usd = await fetch_ton_usd() if nfts else None
+    unpriced = 0
 
     if not nfts:
-        text = f"🎁 У {target_name} нет NFT-подарков (или они скрыты в профиле)."
+        text = f"🎁 У {target_name} нет NFT-подарков" + (
+            f" (обычных подарков: {regular_count})." if regular_count else " (или они скрыты в профиле)."
+        )
     else:
         # Предзагружаем цены параллельно (по уникальным модели/коллекции, с кэшем)
-        if ton_usd and TONNEL_ENABLED:
-            seen = []
-            for g in nfts:
-                base, model = _nft_names(g)
-                for k in ((base, model), (base, None)):
-                    if base and k not in seen:
-                        seen.append(k)
-            await asyncio.gather(*(tonnel_floor_ton(b, m) for b, m in seen[:PRICE_LOOKUP_MAX]))
-
-        rows, total_usd, unpriced = [], 0.0, 0
+        pairs: list[tuple[str, str | None]] = []
         for g in nfts:
-            ug = getattr(g, "gift", None)
-            name = getattr(ug, "name", None) or getattr(ug, "base_name", None) or "NFT"
-            number = getattr(ug, "number", None)
-            title = f"{getattr(ug, 'base_name', None) or name}" + (f" #{number}" if number else "")
+            base, model, _ = nft_fields(g)
+            if base and (base, model) not in pairs:
+                pairs.append((base, model))
+        if ton_usd:
+            await asyncio.gather(*(market_floor_ton(b, m) for b, m in pairs[:PRICE_LOOKUP_MAX]))
+
+        rows, total_usd = [], 0.0
+        for g in nfts:
+            base, model, number = nft_fields(g)
+            title = (base or "NFT") + (f" #{number}" if number else "") + (f" ({model})" if model else "")
             price, source = await nft_price_usd(g, ton_usd)
             if price is None:
                 unpriced += 1
                 rows.append((0.0, f"• {title} — цена неизвестна"))
             else:
                 total_usd += price
-                rows.append((price, f"• {title} — {format_usd(price, usd_rub, eur_rub)}" + (f" ({source})" if source else "")))
+                rows.append((price, f"• {title} — {format_usd(price, usd_rub, eur_rub)} ({source})"))
 
         rows.sort(key=lambda r: r[0], reverse=True)
-        shown = [r[1] for r in rows[:GIFTS_LIST_LIMIT]]
         lines = [f"🖼 NFT-подарки {'вашего аккаунта' if is_self else 'пользователя ' + target_name}: {len(nfts)}", ""]
-        lines += shown
+        lines += [r[1] for r in rows[:GIFTS_LIST_LIMIT]]
         if len(rows) > GIFTS_LIST_LIMIT:
             lines.append(f"…и ещё {len(rows) - GIFTS_LIST_LIMIT}")
         lines += [
             "",
             f"💰 Итого: {format_usd(total_usd, usd_rub, eur_rub)}",
-            f"📈 Курс: 1 $ = {usd_rub:.2f} ₽, 1 € = {eur_rub:.2f} ₽" + ("" if fresh else " (запасной)"),
+            f"📈 Курс: 1 $ = {usd_rub:.2f} ₽, 1 € = {eur_rub:.2f} ₽" + ("" if fresh else " (запасной)")
+            + (f", 1 TON = ${ton_usd:.2f}" if ton_usd else ""),
         ]
         if unpriced:
             lines.append(f"⚠️ Без цены: {unpriced} (в итог не входят)")
         lines.append("Оценка примерная: рыночная цена NFT может сильно отличаться.")
         text = "\n".join(lines)[:4000]
+
+    # Если цены не получены — владельцу в личку приходит причина (собеседник её не видит)
+    if nfts and unpriced and _PRICE_ERRORS:
+        uniq = list(dict.fromkeys(_PRICE_ERRORS))[:4]
+        await notify_owner(
+            owner_id,
+            "ℹ️ Часть цен не получена. Причины:\n" + "\n".join(f"• {u}" for u in uniq)
+            + "\n\nНужно: pip install TelegramGifts (добавьте в requirements.txt)."
+        )
 
     if is_self:
         await try_delete_message(conn_id, message.message_id)
@@ -3364,7 +3474,7 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
     ("2.5", [
-        "🖼 .gifts теперь показывает цены NFT-подарков по флору Tonnel (модель/коллекция)",
+        "🖼 .gifts: цены NFT-подарков по флору маркетов (TGMrkt/GetGems/Fragment), модель и коллекция",
         "💾 Исправлено резервное копирование: балансы звёзд надёжно сохраняются и восстанавливаются",
     ]),
     ("2.4", [
