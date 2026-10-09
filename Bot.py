@@ -54,6 +54,21 @@ CAPTION_LIMIT = 1024
 MAX_TEXT_LEN = 3000
 
 
+async def ensure_columns(table: str, columns: dict):
+    """Если таблица осталась от старой версии бота, добавляем недостающие колонки.
+    Иначе INSERT/UPDATE падает с "no column named ..." и команды (например, .dicep) молча не работают."""
+    async with db_conn.execute(f"PRAGMA table_info({table})") as cur:
+        existing = {row[1] for row in await cur.fetchall()}
+    for name, decl in columns.items():
+        if name in existing:
+            continue
+        try:
+            await db_conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            logging.warning(f"[БАЗА] В таблицу {table} добавлена колонка {name}")
+        except Exception as e:
+            logging.error(f"[БАЗА] Не удалось добавить колонку {name} в {table}: {e}")
+
+
 async def init_db():
     global db_conn
     os.makedirs(os.path.dirname(os.path.abspath(DB_NAME)), exist_ok=True)
@@ -194,6 +209,21 @@ async def init_db():
             created INTEGER
         )
     ''')
+    # Миграция таблиц, созданных старыми версиями бота
+    await ensure_columns("users", {"balance": "INTEGER DEFAULT 0"})
+    await ensure_columns("stars_games", {
+        "player1": "INTEGER", "player1_name": "TEXT", "player2": "INTEGER", "player2_name": "TEXT",
+        "bet": "INTEGER", "status": "TEXT", "created": "INTEGER",
+    })
+    await ensure_columns("withdrawals", {
+        "user_id": "INTEGER", "name": "TEXT", "username": "TEXT", "amount": "INTEGER",
+        "status": "TEXT", "created": "INTEGER",
+    })
+    await ensure_columns("donations", {
+        "user_id": "INTEGER", "name": "TEXT", "username": "TEXT", "amount": "INTEGER", "created": "INTEGER",
+    })
+    await db_conn.commit()
+
     # Подтягиваем уже известных пользователей (владельцы подключений и игроки)
     await db_conn.execute(
         "INSERT OR IGNORE INTO bot_users (user_id, name, started) "
@@ -2709,6 +2739,145 @@ async def cmd_bal(message: types.Message):
     await message.answer(f"💳 <b>Ваш игровой баланс:</b> {balance} ⭐️", parse_mode="HTML")
 
 
+# --- создание и отмена дуэли: .dicep, .cancel ---
+
+DICEP_DEFAULT_BET = 50
+DICEP_MAX_OPEN = 3  # сколько неначатых игр может держать один игрок
+CANCELABLE = "('waiting_p1_payment', 'ready_for_p2', 'waiting_p2_payment')"
+
+
+async def p1_payment_timeout(game_id: int):
+    """Если создатель не оплатил счёт — убираем игру."""
+    await asyncio.sleep(STARS_P2_TIMEOUT)
+    await db_conn.execute("DELETE FROM stars_games WHERE id = ? AND status = 'waiting_p1_payment'", (game_id,))
+    await db_conn.commit()
+
+
+def user_safe(func):
+    """Если команда упала, пишем причину в чат, а не молчим (и логируем полный traceback)."""
+    @functools.wraps(func)
+    async def wrapper(message: types.Message, **kwargs):
+        try:
+            return await func(message)
+        except Exception as e:
+            logging.exception(f"[STARS] Ошибка в {func.__name__}")
+            try:
+                await message.answer(f"❌ Ошибка в {func.__name__}: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+    return wrapper
+
+
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.dicep(\s|$)"))
+@user_safe
+async def cmd_dicep(message: types.Message):
+    """.dicep [ставка] — создать дуэль на кубиках. Ставка списывается с игрового баланса, а если его не хватает — выставляется счёт."""
+    user = message.from_user
+    parts = message.text.split()
+    if len(parts) > 2 or (len(parts) == 2 and not parts[1].isdigit()):
+        return await message.answer(f"Формат: .dicep ставка (например, .dicep 50). Ставка от {STARS_MIN_BET} до {STARS_MAX_BET} ⭐️.")
+    bet = int(parts[1]) if len(parts) == 2 else DICEP_DEFAULT_BET
+    if not STARS_MIN_BET <= bet <= STARS_MAX_BET:
+        return await message.answer(f"❌ Ставка должна быть от {STARS_MIN_BET} до {STARS_MAX_BET} ⭐️.")
+
+    async with db_conn.execute(
+        f"SELECT COUNT(*) FROM stars_games WHERE player1 = ? AND status IN {CANCELABLE}", (user.id,)
+    ) as cur:
+        (open_games,) = await cur.fetchone()
+    if open_games >= DICEP_MAX_OPEN:
+        return await message.answer(f"❌ У вас уже {open_games} неначатых игр. Отмените лишние командой .cancel.")
+
+    # Хватает игрового баланса — ставка списывается сразу
+    if await try_deduct(user.id, bet):
+        try:
+            game_id = await create_game(user.id, user.full_name, bet, "ready_for_p2")
+        except Exception as e:
+            await add_balance(user.id, bet)  # не потеряем ставку, если игру создать не вышло
+            logging.error(f"[STARS] Не удалось создать игру: {e}")
+            return await message.answer("❌ Не удалось создать игру, ставка возвращена на баланс.")
+        await message.answer(f"💳 С игрового баланса списано {bet} ⭐️.")
+        try:
+            return await send_invite(message.chat.id, game_id)
+        except Exception as e:
+            logging.exception("[STARS] Не удалось отправить приглашение")
+            return await message.answer(
+                f"⚠️ Игра #{game_id} создана, но ссылку отправить не удалось ({type(e).__name__}: {e}). "
+                f"Напишите .cancel {game_id}, чтобы вернуть ставку."
+            )
+
+    # Баланса не хватает — счёт на оплату ставки
+    game_id = await create_game(user.id, user.full_name, bet, "waiting_p1_payment")
+    try:
+        await bot.send_invoice(
+            chat_id=message.chat.id,
+            title=f"Дуэль на кубиках #{game_id}",
+            description=f"Ставка {bet} ⭐️. После оплаты вы получите ссылку для соперника.",
+            payload=f"p1_pay_{game_id}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Ставка в игре #{game_id}", amount=bet)],
+        )
+    except Exception as e:
+        await db_conn.execute("DELETE FROM stars_games WHERE id = ?", (game_id,))
+        await db_conn.commit()
+        logging.error(f"[STARS] Не удалось выставить счёт: {e}")
+        return await message.answer(f"❌ Не удалось выставить счёт: {e}")
+    spawn(p1_payment_timeout(game_id))
+
+
+async def cancel_game(game_id: int, user_id: int) -> str:
+    game = await get_game(game_id)
+    if not game or game["player1"] != user_id:
+        return f"❌ Игра #{game_id} не найдена или это не ваша игра."
+    if game["status"] == "rolling":
+        return f"❌ Игра #{game_id} уже началась, отменить нельзя."
+
+    # Атомарное удаление: если игра успела начаться, строка не удалится и ставка не вернётся дважды
+    cur = await db_conn.execute(
+        f"DELETE FROM stars_games WHERE id = ? AND player1 = ? AND status IN {CANCELABLE}", (game_id, user_id)
+    )
+    await db_conn.commit()
+    if not cur.rowcount:
+        return f"❌ Игра #{game_id} уже началась или отменена."
+
+    if game["status"] == "waiting_p2_payment" and game.get("player2"):
+        await safe_send(game["player2"], f"❌ Создатель отменил игру #{game_id}.")
+
+    if game["status"] == "waiting_p1_payment":
+        return f"✅ Игра #{game_id} отменена (ставка ещё не была оплачена)."
+    await add_balance(user_id, game["bet"])
+    return f"✅ Игра #{game_id} отменена. Ставка {game['bet']} ⭐️ вернулась на игровой баланс."
+
+
+@stars_router.message(F.chat.type == "private", F.text.regexp(r"^\.cancel(\s+\d+)?$"))
+async def cmd_cancel(message: types.Message):
+    """.cancel — отменить все свои неначатые игры; .cancel N — только игру №N."""
+    user_id = message.from_user.id
+    parts = message.text.split()
+    if len(parts) == 2:
+        return await message.answer(await cancel_game(int(parts[1]), user_id))
+
+    async with db_conn.execute(
+        f"SELECT id FROM stars_games WHERE player1 = ? AND status IN {CANCELABLE} ORDER BY id", (user_id,)
+    ) as cur:
+        ids = [r[0] for r in await cur.fetchall()]
+    if not ids:
+        return await message.answer("У вас нет неначатых игр.")
+    results = [await cancel_game(i, user_id) for i in ids]
+    await message.answer("\n".join(results))
+
+
+@stars_router.callback_query(F.data.regexp(r"^cancel_\d+$"))
+async def cb_cancel(call: types.CallbackQuery):
+    game_id = int(call.data.split("_", 1)[1])
+    result = await cancel_game(game_id, call.from_user.id)
+    await call.answer(result[:190], show_alert=not result.startswith("✅"))
+    if result.startswith("✅"):
+        try:
+            await call.message.edit_text(result, reply_markup=None)
+        except Exception as e:
+            logging.info(f"[STARS] Не удалось обновить сообщение отмены: {e}")
+
+
 # --- вывод звёзд: заявки приходят админу ---
 
 WITHDRAW_MIN = 50
@@ -3567,6 +3736,12 @@ NOTIFY_STATUS = True  # писать пользователям бота о за
 # При каждом обновлении добавляйте НОВУЮ запись В НАЧАЛО списка (с новой версией).
 # После запуска бот сам пришлёт её всем пользователям.
 CHANGELOG = [
+    ("2.8", [
+        "🎲 .dicep: исправлена работа со старой базой данных, а при сбое бот теперь пишет причину ошибки",
+    ]),
+    ("2.7", [
+        "🎲 Исправлена команда .dicep: снова можно создавать дуэль на звёзды и отменять её через .cancel",
+    ]),
     ("2.6", [
         "🎭 Добавлены новые фразы для режимов .kawaii, .tsundere и .yandere",
     ]),
