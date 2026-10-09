@@ -1591,20 +1591,32 @@ async def fetch_fiat_rates() -> tuple[float, float, bool]:
 _TON_RATE: dict = {"ts": 0.0, "usd": None}
 
 TON_RATE_SOURCES = [
+    ("https://tonapi.io/v2/rates?tokens=ton&currencies=usd", lambda d: d["rates"]["TON"]["prices"]["USD"]),
+    ("https://coins.llama.fi/prices/current/coingecko:the-open-network",
+     lambda d: d["coins"]["coingecko:the-open-network"]["price"]),
+    ("https://api.coinpaprika.com/v1/tickers/toncoin-the-open-network", lambda d: d["quotes"]["USD"]["price"]),
     ("https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd",
      lambda d: d["the-open-network"]["usd"]),
+    ("https://api.mexc.com/api/v3/ticker/price?symbol=TONUSDT", lambda d: d["price"]),
+    ("https://api.gateio.ws/api/v4/spot/tickers?currency_pair=TON_USDT", lambda d: d[0]["last"]),
+    ("https://api.bybit.com/v5/market/tickers?category=spot&symbol=TONUSDT",
+     lambda d: d["result"]["list"][0]["lastPrice"]),
+    ("https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=TON-USDT", lambda d: d["data"]["price"]),
     ("https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT", lambda d: d["price"]),
     ("https://www.okx.com/api/v5/market/ticker?instId=TON-USDT", lambda d: d["data"][0]["last"]),
 ]
+RATE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SaverBot/1.0)", "Accept": "application/json"}
 
 
 async def fetch_ton_usd() -> float | None:
-    """Курс TON в $: несколько бирж по очереди, затем TON_USD из окружения."""
+    """Курс TON в $: источники по очереди; последний удачный курс сохраняется в базе на случай сбоя."""
     if _TON_RATE["usd"] and time.time() - _TON_RATE["ts"] < PRICE_TTL_OK:
         return _TON_RATE["usd"]
-    timeout = aiohttp.ClientTimeout(total=8)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    timeout = aiohttp.ClientTimeout(total=6)
+    errors = []
+    async with aiohttp.ClientSession(timeout=timeout, headers=RATE_HEADERS) as session:
         for url, extract in TON_RATE_SOURCES:
+            host = url.split("/")[2]
             try:
                 async with session.get(url) as resp:
                     if resp.status != 200:
@@ -1613,12 +1625,28 @@ async def fetch_ton_usd() -> float | None:
                 rate = float(extract(data))
                 if rate > 0:
                     _TON_RATE.update(ts=time.time(), usd=rate)
+                    try:
+                        await set_meta("ton_usd", str(rate))
+                    except Exception:
+                        pass
                     return rate
+                raise RuntimeError("пустой курс")
             except Exception as e:
-                logging.warning(f"[GIFTS] Курс TON ({url.split('/')[2]}): {e}")
-    if not _TON_RATE["usd"] and not TON_USD_FALLBACK:
-        _PRICE_ERRORS.append("не удалось получить курс TON (CoinGecko/Binance/OKX недоступны)")
-    return _TON_RATE["usd"] or (TON_USD_FALLBACK or None)
+                errors.append(f"{host}: {type(e).__name__} {str(e)[:40]}".strip())
+                logging.warning(f"[GIFTS] Курс TON ({host}): {e}")
+
+    # Все источники недоступны: берём последний сохранённый курс или TON_USD из окружения
+    saved = None
+    try:
+        saved = _positive(await get_meta("ton_usd"))
+    except Exception:
+        pass
+    rate = _TON_RATE["usd"] or saved or (TON_USD_FALLBACK or None)
+    if rate:
+        _PRICE_ERRORS.append("курс TON не получен, использован сохранённый/запасной: $%.2f" % rate)
+    else:
+        _PRICE_ERRORS.append("не удалось получить курс TON: " + "; ".join(errors[:4]))
+    return rate
 
 
 def format_usd(usd: float, usd_rub: float, eur_rub: float) -> str:
