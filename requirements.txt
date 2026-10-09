@@ -1,6 +1,6 @@
-aiogram
-aiosqlite
+aiogram>=3.24
 aiohttp
-   yt-dlp[default,curl-cffi]
+aiosqlite
+yt-dlp
 Pillow
-tonnelmp
+TelegramGifts
